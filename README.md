@@ -84,6 +84,35 @@ In this course project, it is required to complete the implementation of key fun
 ```
 构造函数中，使得行指针分别指向矩阵各行的首元素指针即可，并在析构函数中释放行指针。
 
+
+<strong>为什么这样设计？</strong>
+
+内存局部性：linear_ 是连续分配的，适合缓存优化，提高访问效率。
+
+灵活性：RowMatrix 可以通过 data_ 提供行指针，方便某些算法（如行交换只需交换指针，无需复制数据）。
+
+避免多层 new：如果直接 new T[rows][cols]，可能会涉及多次内存分配，而这种方式只需一次大块分配 + 一个行指针数组。
+
+
+```
+linear_ = [0,1,2,3, 4,5,6,7, 8,9,10,11, X]  // X 是多余的元素
+data_ = [
+    &linear_[0] → [0,1,2,3],
+    &linear_[4] → [4,5,6,7],
+    &linear_[8] → [8,9,10,11]
+]
+---------
+data_ = [
+    &linear_[0],  // 第 0 行的起始地址 → 指向 (0,0)
+    &linear_[4],  // 第 1 行的起始地址 → 指向 (1,0)
+    &linear_[8]   // 第 2 行的起始地址 → 指向 (2,0)
+]
+---------
+data_[i][j] == *(data_[i] + j) == linear_[i * cols + j]
+
+```
+以上是举了一个例子；
+
 ```
 147   T GetElement(int i, int j) const override {
 148     if (i < 0 || j < 0 || i >= this->rows_ || j >= this->cols_) {
