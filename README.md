@@ -207,5 +207,17 @@ data_[i][j] == *(data_[i] + j) == linear_[i * cols + j]
 ```
 以上三个矩阵操作函数的逻辑都比较简单，唯一需要注意的是在运算前应检查两矩阵的规格是否匹配。
 
+矩阵乘法示意：
+
+<img src="https://github.com/user-attachments/assets/95ebb8c8-7415-44d0-93f2-a72a3ddc8e4d" 
+     alt="image" 
+     style="width:30%; max-width:600px;">
+
+
+
+---
+
+## Project 1 : BUFFER POOL
+
 
 
