@@ -21,14 +21,20 @@ In this course project, it is required to complete the implementation of key fun
 - Pessimistic and optimistic concurrency control protocols (i.e., methods for executing multiple transactions) in relational databases, such as two-phase locking, timestamp-based concurrency control, and multi-version concurrency control;
 - Crash recovery algorithms to ensure atomicity, isolation, and durability in relational databases, including strategies like logging, checkpoints, redo, and undo operations.
 
+
+
 ---
+
+
 ## Project 0 : C++ Primer
 
 本实验的目的为编写一组简单的矩阵运算类，以检验实验者的C++编程能力，并帮助实验者熟悉本课程实验的环境配置及提交流程。
 
+
 ### 代码实现
 
 在本实验中需要实现三个类，其中Matrix作为矩阵类型的基类，存放指向实际矩阵元素数组的指针；RowMatrix 为 Matrix 的子类，存放指向各矩阵行的指针，并提供按行列数访问矩阵元素的接口；RowMatrixOperations提供矩阵相加、相乘函数的接口。本实验的逻辑比较简单，主要考察对C++继承和模板的使用。
+
 
 ### Matrix
 ```
@@ -104,6 +110,7 @@ In this course project, it is required to complete the implementation of key fun
 190   }
 ```
 利用行指针提取和设置矩阵元素，在提供的行列值超出范围时抛出异常。
+
 
 ### RowMatrixOperations
 ```
