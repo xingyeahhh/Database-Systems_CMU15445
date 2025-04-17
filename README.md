@@ -477,4 +477,45 @@ pages_[frame_id]...              // 直接使用frame_id作为索引
 ```
 FlushAllPgsImp将缓冲池内的所有页面写回磁盘。在这里，遍历page_table_以获得缓冲池内的<页面ID - 槽位ID>对，通过槽位ID获取实际页面，并通过页面ID作为写回磁盘的参数。
 
+```
+ 76 Page *BufferPoolManagerInstance::NewPgImp(page_id_t *page_id) {
+ 77   // 0.   Make sure you call AllocatePage!
+ 78   // 1.   If all the pages in the buffer pool are pinned, return nullptr.
+ 79   // 2.   Pick a victim page P from either the free list or the replacer. Always pick from the free list first.
+ 80   // 3.   Update P's metadata, zero out memory and add P to the page table.
+ 81   // 4.   Set the page ID output parameter. Return a pointer to P.
+ 82   frame_id_t new_frame_id;
+ 83   latch_.lock();
+ 84   if (!free_list_.empty()) {
+ 85     new_frame_id = free_list_.front();
+ 86     free_list_.pop_front();
+ 87   } else if (!replacer_->Victim(&new_frame_id)) {
+ 88     latch_.unlock();
+ 89     return nullptr;
+ 90   }
+ 91   *page_id = AllocatePage();
+ 92   if (pages_[new_frame_id].IsDirty()) {
+ 93     page_id_t flush_page_id = pages_[new_frame_id].page_id_;
+ 94     pages_[new_frame_id].is_dirty_ = false;
+ 95     disk_manager_->WritePage(flush_page_id, pages_[new_frame_id].GetData());
+ 96   }
+ 97   page_table_.erase(pages_[new_frame_id].page_id_);
+ 98   page_table_[*page_id] = new_frame_id;
+ 99   pages_[new_frame_id].page_id_ = *page_id;
+100   pages_[new_frame_id].ResetMemory();
+101   pages_[new_frame_id].pin_count_ = 1;
+102   replacer_->Pin(new_frame_id);
+103   latch_.unlock();
+104   return &pages_[new_frame_id];
+105 }
+
+```
+**结构**
+
+
+
+<img src="https://github.com/user-attachments/assets/692bbe79-e24f-4bdc-9dd3-0ae2be41a8a9" 
+     alt="image" 
+     style="width:50%; max-width:600px;">
+
 
