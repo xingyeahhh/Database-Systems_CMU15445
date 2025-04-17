@@ -313,6 +313,30 @@ data_[i][j] == *(data_[i] + j) == linear_[i * cols + j]
 
 对于Unpin，其检查LRUReplace中是否存在对应页面ID的节点，如存在则直接返回，如不存在则在链表尾部插入页面ID的节点，并在哈希表中插入<页面ID - 链表尾节点>映射。
 
+**Pin (固定)**
+
+- 当一个页面被"Pin"时，意味着它正在被某个事务或操作使用
+
+- 被Pin的页面不能被缓冲池替换算法(如LRU)驱逐
+
+- 在代码中，Pin操作会从LRU替换器中移除该页面
+
+**Unpin (取消固定)**
+
+- 当一个页面被"Unpin"时，意味着它不再被任何事务或操作使用
+
+- 被Unpin的页面可以被缓冲池替换算法考虑驱逐
+
+- 在代码中，Unpin操作会将页面添加回LRU替换器
+
+**这与数据库的事务安全和并发控制有关：**
+
+保护正在使用的页面：当一个事务正在读取或修改页面时，我们不希望这个页面被意外地从缓冲池中移除，否则会导致数据不一致或操作失败。
+
+引用计数机制：实际上，一个页面可能被多个事务同时访问，所以通常会有一个引用计数。只有当引用计数降为0时(即没有事务再使用它)，才会真正执行Unpin操作。
+
+LRU替换策略：只有那些没有被Pin的页面(即当前没有被任何事务使用的页面)才能参与LRU替换决策。
+
 ```
  54 size_t LRUReplacer::Size() {
  55   data_latch_.lock();
@@ -328,5 +352,67 @@ data_[i][j] == *(data_[i] + j) == linear_[i * cols + j]
 
 在部分中，需要实现缓冲池管理模块，其从DiskManager中获取数据库页面，并在缓冲池强制要求时或驱逐页面时将数据库脏页面写回DiskManager。
 
+```
+ 30 class BufferPoolManagerInstance : public BufferPoolManager {
+...
+134   Page *pages_;
+135   /** Pointer to the disk manager. */
+136   DiskManager *disk_manager_ __attribute__((__unused__));
+137   /** Pointer to the log manager. */
+138   LogManager *log_manager_ __attribute__((__unused__));
+139   /** Page table for keeping track of buffer pool pages. */
+140   std::unordered_map<page_id_t, frame_id_t> page_table_;
+141   /** Replacer to find unpinned pages for replacement. */
+142   Replacer *replacer_;
+143   /** List of free pages. */
+144   std::list<frame_id_t> free_list_;
+145   /** This latch protects shared data structures. We recommend updating this comment to describe     what it protects. */
+146   std::mutex latch_;
+147 };
+```
+
+缓冲池的成员如上所示，其中pages_为缓冲池中的实际容器页面槽位数组，用于存放从磁盘中读入的页面，并供DBMS访问；disk_manager_为磁盘管理器，提供从磁盘读入页面及写入页面的接口；·log_manager_为日志管理器，本实验中不用考虑该组件；page_table_用于保存磁盘页面IDpage_id和槽位IDframe_id_t的映射；raplacer_用于选取所需驱逐的页面；free_list_保存缓冲池中的空闲槽位ID。在这里，区分page_id和frame_id_t是完成本实验的关键。
+
+```
+ 28 class Page {
+ 29   // There is book-keeping information inside the page that should only be relevant to the buffer     pool manager.
+ 30   friend class BufferPoolManagerInstance;
+ 31 
+ 32  public:
+ 33   /** Constructor. Zeros out the page data. */
+ 34   Page() { ResetMemory(); }
+ 35 
+ 36   /** Default destructor. */
+ 37   ~Page() = default;
+ 38 
+ 39   /** @return the actual data contained within this page */
+ 40   inline auto GetData() -> char * { return data_; }
+ 41 
+ 42   /** @return the page id of this page */
+ 43   inline auto GetPageId() -> page_id_t { return page_id_; }
+ 44 
+ 45   /** @return the pin count of this page */
+ 46   inline auto GetPinCount() -> int { return pin_count_; }
+ 47 
+ 48   /** @return true if the page in memory has been modified from the page on disk, false otherwise     */
+ 49   inline auto IsDirty() -> bool { return is_dirty_; }
+...
+ 77  private:
+ 78   /** Zeroes out the data that is held within the page. */
+ 79   inline void ResetMemory() { memset(data_, OFFSET_PAGE_START, PAGE_SIZE); }
+ 80 
+ 81   /** The actual data that is stored within a page. */
+ 82   char data_[PAGE_SIZE]{};
+ 83   /** The ID of this page. */
+ 84   page_id_t page_id_ = INVALID_PAGE_ID;
+ 85   /** The pin count of this page. */
+ 86   int pin_count_ = 0;
+ 87   /** True if the page is dirty, i.e. it is different from its corresponding page on disk. */
+ 88   bool is_dirty_ = false;
+ 89   /** Page latch. */
+ 90   ReaderWriterLatch rwlatch_;
+ 91 };
+
+```
 
 
