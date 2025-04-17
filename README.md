@@ -219,5 +219,71 @@ data_[i][j] == *(data_[i] + j) == linear_[i * cols + j]
 
 ## Project 1 : BUFFER POOL
 
+在本实验中，需要在存储管理器中实现缓冲池。缓冲池负责将物理页面从磁盘中读入内存、或从内存中写回磁盘，使得DBMS可以支持大于内存大小的存储容量。并且，缓冲池应当是用户透明且线程安全的。
+
+### Task1 : LRU REPLACEMENT POLICY
+本部分中需要实现缓冲池中的LRUReplacer，该组件的功能是跟踪缓冲池内的页面使用情况，并在缓冲池容量不足时驱除缓冲池中最近最少使用的页面。其应当具备如下接口：
+
+- Victim(frame_id_t*)：驱逐缓冲池中最近最少使用的页面，并将其内容存储在输入参数中。当LRUReplacer为空时返回False，否则返回True；
+- Pin(frame_id_t)：当缓冲池中的页面被用户访问时，该方法被调用使得该页面从LRUReplacer中驱逐，以使得该页面固定在缓存池中；
+- Unpin(frame_id_t)：当缓冲池的页面被所有用户使用完毕时，该方法被调用使得该页面被添加在LRUReplacer，使得该页面可以被缓冲池驱逐；
+- Size()：返回LRUReplacer中页面的数目；
+
+```
+ 28 class LRUReplacer : public Replacer {
+ 29  public:
+ 30   /**
+ 31    * Create a new LRUReplacer.
+ 32    * @param num_pages the maximum number of pages the LRUReplacer will be required to store
+ 33    */
+ 34   explicit LRUReplacer(size_t num_pages);
+ 35   
+ 36   /**
+ 37    * Destroys the LRUReplacer.
+ 38    */
+ 39   ~LRUReplacer() override;
+ 40   
+ 41   bool Victim(frame_id_t *frame_id) override;
+ 42 
+ 43   void Pin(frame_id_t frame_id) override;
+ 44   
+ 45   void Unpin(frame_id_t frame_id) override;
+ 46   
+ 47   size_t Size() override;
+ 48 
+ 49   void DeleteNode(LinkListNode *curr);
+ 50 
+ 51  private:
+ 52   // TODO(student): implement me!
+ 53   std::unordered_map<frame_id_t, std::list<frame_id_t>::iterator> data_idx_;
+ 54   std::list<frame_id_t> data_;
+ 55   std::mutex data_latch_;
+ 56 };
+```
+
+在这里，LRU策略可以由哈希表加双向链表的方式实现，其中链表充当队列的功能以记录页面被访问的先后顺序，哈希表则记录<页面ID - 链表节点>键值对，以在O(1)复杂度下删除链表元素。实际实现中使用STL中的哈希表unordered_map和双向链表list，并在unordered_map中存储指向链表节点的list::iterator。
+
+```
+ 21 bool LRUReplacer::Victim(frame_id_t *frame_id) {
+ 22   data_latch_.lock();
+ 23   if (data_idx_.empty()) {
+ 24     data_latch_.unlock();
+ 25     return false;
+ 26   }
+ 27   *frame_id = data_.front();
+ 28   data_.pop_front();
+ 29   data_idx_.erase(*frame_id);
+ 30   data_latch_.unlock();
+ 31   return true;
+ 32 }
+```
+
+对于Victim，首先判断链表是否为空，如不为空则返回链表首节点的页面ID，并在哈希表中解除指向首节点的映射。为了保证线程安全，整个函数应当由mutex互斥锁保护，下文中对互斥锁操作不再赘述。
+
+- 链表头部（front） 通常存放 最近最少使用（LRU） 的页面（即最久未访问的）
+- 链表尾部（back） 通常存放 最近使用（MRU） 的页面（即最新访问的）
+- 参数 frame_id_t *frame_id 的作用是一个 输出型参数（output parameter），它的作用是： 调用方（比如缓存管理器）传入一个 frame_id_t 变量的地址; Victim 方法 找到要淘汰的 frame 后，把结果 写入这个地址指向的内存,这样调用方就能拿到被淘汰的 frame ID.
+- 为什么用指针而不是返回值？ 返回值 bool 只用来表示成功/失败（是否有 victim）,实际的 victim frame ID 通过指针参数返回,这是 C/C++ 中常见的**多值返回**设计模式.
+
 
 
