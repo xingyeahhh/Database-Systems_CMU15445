@@ -285,5 +285,48 @@ data_[i][j] == *(data_[i] + j) == linear_[i * cols + j]
 - 参数 frame_id_t *frame_id 的作用是一个 输出型参数（output parameter），它的作用是： 调用方（比如缓存管理器）传入一个 frame_id_t 变量的地址; Victim 方法 找到要淘汰的 frame 后，把结果 写入这个地址指向的内存,这样调用方就能拿到被淘汰的 frame ID.
 - 为什么用指针而不是返回值？ 返回值 bool 只用来表示成功/失败（是否有 victim）,实际的 victim frame ID 通过指针参数返回,这是 C/C++ 中常见的**多值返回**设计模式.
 
+```
+ 34 void LRUReplacer::Pin(frame_id_t frame_id) {
+ 35   data_latch_.lock();
+ 36   auto it = data_idx_.find(frame_id);
+ 37   if (it != data_idx_.end()) {
+ 38     data_.erase(it->second);
+ 39     data_idx_.erase(it);
+ 40   }
+ 41   data_latch_.unlock();
+ 42 }
+```
+
+对于Pin，其检查LRUReplace中是否存在对应页面ID的节点，如不存在则直接返回，如存在对应节点则通过哈希表中存储的迭代器删除链表节点，并解除哈希表对应页面ID的映射。
+
+```
+ 44 void LRUReplacer::Unpin(frame_id_t frame_id) {
+ 45   data_latch_.lock();
+ 46   auto it = data_idx_.find(frame_id);
+ 47   if (it == data_idx_.end()) {
+ 48     data_.push_back(frame_id);
+ 49     data_idx_[frame_id] = prev(data_.end());
+ 50   }
+ 51   data_latch_.unlock();
+ 52 }
+```
+
+对于Unpin，其检查LRUReplace中是否存在对应页面ID的节点，如存在则直接返回，如不存在则在链表尾部插入页面ID的节点，并在哈希表中插入<页面ID - 链表尾节点>映射。
+
+```
+ 54 size_t LRUReplacer::Size() {
+ 55   data_latch_.lock();
+ 56   size_t ret = data_idx_.size();
+ 57   data_latch_.unlock();
+ 58   return ret;
+ 59 }
+```
+
+对于Size，返回哈希表大小即可。
+
+### Task2 : BUFFER POOL MANAGER INSTANCE
+
+在部分中，需要实现缓冲池管理模块，其从DiskManager中获取数据库页面，并在缓冲池强制要求时或驱逐页面时将数据库脏页面写回DiskManager。
+
 
 
