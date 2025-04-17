@@ -415,4 +415,66 @@ LRU替换策略：只有那些没有被Pin的页面(即当前没有被任何事�
 
 ```
 
+Page是缓冲池中的页面容器，data_保存对应磁盘页面的实际数据；page_id_保存该页面在磁盘管理器中的页面ID；pin_count_保存DBMS中正使用该页面的用户数目；is_dirty_保存该页面自磁盘读入或写回后是否被修改。下面，将介绍缓冲池中的接口实现：
+
+```
+ 51 bool BufferPoolManagerInstance::FlushPgImp(page_id_t page_id) {
+ 52   // Make sure you call DiskManager::WritePage!
+ 53   frame_id_t frame_id;
+ 54   latch_.lock();
+ 55   if (page_table_.count(page_id) == 0U) {
+ 56     latch_.unlock();
+ 57     return false;
+ 58   }
+ 59   frame_id = page_table_[page_id];
+ 60   pages_[frame_id].is_dirty_ = false;
+ 61   disk_manager_->WritePage(page_id, pages_[frame_id].GetData());
+ 62   latch_.unlock();
+ 63   return true;
+ 64 }
+```
+
+FlushPgImp用于显式地将缓冲池页面写回磁盘。首先，应当检查缓冲池中是否存在对应页面ID的页面，如不存在则返回False；如存在对应页面，则将缓冲池内的该页面的is_dirty_置为false，并使用WritePage将该页面的实际数据data_写回磁盘。在这里，需要使用互斥锁保证线程安全，在下文中不再赘述。
+
+**page_id（磁盘页面ID）：**
+
+- 唯一标识磁盘上的一个物理页面
+
+- 由 DiskManager 分配和管理
+
+- 即使系统重启，相同的 page_id 仍然指向磁盘上相同的物理位置
+
+**frame_id（内存帧ID）：**
+
+- 唯一标识缓冲池（内存）中的一个槽位（slot）
+
+- 是 pages_ 数组的索引（pages_[frame_id] 就是具体的 Page 对象）
+
+- 缓冲池大小固定，frame_id 的范围是 [0, pool_size)（例如缓冲池有100个页面，frame_id 范围就是0~99）
+
+**pages_ (Page数组指针)**
+
+- 这是缓冲池的核心存储区域，指向一个Page对象的数组
+
+- 每个Page对象代表内存中的一个页面(frame)，可以存放从磁盘读取的数据页
+
+- 数组大小等于缓冲池的容量(frame数量)
+```
+frame_id = page_table_[page_id];  // 通过page_id获取frame_id
+pages_[frame_id]...              // 直接使用frame_id作为索引
+```
+
+```
+ 66 void BufferPoolManagerInstance::FlushAllPgsImp() {
+ 67   // You can do it!
+ 68   latch_.lock();
+ 69   for (auto [page_id, frame_id] : page_table_) {
+ 70     pages_[frame_id].is_dirty_ = false;
+ 71     disk_manager_->WritePage(page_id, pages_[frame_id].GetData());
+ 72   }
+ 73   latch_.unlock();
+ 74 }
+```
+FlushAllPgsImp将缓冲池内的所有页面写回磁盘。在这里，遍历page_table_以获得缓冲池内的<页面ID - 槽位ID>对，通过槽位ID获取实际页面，并通过页面ID作为写回磁盘的参数。
+
 
