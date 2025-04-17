@@ -512,7 +512,9 @@ FlushAllPgsImp将缓冲池内的所有页面写回磁盘。在这里，遍历pag
 ```
 **结构**
 
-
+<img src="https://github.com/user-attachments/assets/30dc7a14-aa59-4882-9e32-054b79b0cc5c" 
+     alt="image" 
+     style="width:90%; max-width:600px;">
 
 <img src="https://github.com/user-attachments/assets/692bbe79-e24f-4bdc-9dd3-0ae2be41a8a9" 
      alt="image" 
