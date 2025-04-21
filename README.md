@@ -510,6 +510,75 @@ FlushAllPgsImp将缓冲池内的所有页面写回磁盘。在这里，遍历pag
 105 }
 
 ```
+
+NewPgImp在磁盘中分配新的物理页面，将其添加至缓冲池，并返回指向缓冲池页面Page的指针。在这里，该函数由以下步骤组成：
+
+- 检查当前缓冲池中是否存在空闲槽位或存放页面可被驱逐的槽位（下文称其为目标槽位），在这里总是先通过检查free_list_以查询空闲槽位，如无空闲槽位则尝试从replace_中驱逐页面并返回被驱逐页面的槽位。如目标槽位，则返回空指针；如存在目标槽位，则调用AllocatePage()为新的物理页面分配page_id页面ID。
+- 值得注意的是，在这里需要检查目标槽位中的页面是否为脏页面，如是则需将其写回磁盘，并将其脏位设为false；
+- 从page_table_中删除目标槽位中的原页面ID的映射，并将新的<页面ID - 槽位ID>映射插入，然后更新槽位中页面的元数据。需要注意的是，在这里由于我们返回了指向该页面的指针，我们需要将该页面的用户数pin_count_置为1，并调用replacer_的Pin。
+
+
+```
+107 Page *BufferPoolManagerInstance::FetchPgImp(page_id_t page_id) {
+108   // 1.     Search the page table for the requested page (P).
+109   // 1.1    If P exists, pin it and return it immediately.
+110   // 1.2    If P does not exist, find a replacement page (R) from either the free list or the replacer.
+111   //        Note that pages are always found from the free list first.
+112   // 2.     If R is dirty, write it back to the disk.
+113   // 3.     Delete R from the page table and insert P.
+114   // 4.     Update P's metadata, read in the page content from disk, and then return a pointer to P.
+115   frame_id_t frame_id;
+116   latch_.lock();
+117   if (page_table_.count(page_id) != 0U) {
+118     frame_id = page_table_[page_id];
+119     pages_[frame_id].pin_count_++;
+120     replacer_->Pin(frame_id);
+121     latch_.unlock();
+122     return &pages_[frame_id];
+123   }
+124 
+125   if (!free_list_.empty()) {
+126     frame_id = free_list_.front();
+127     free_list_.pop_front();
+128     page_table_[page_id] = frame_id;
+129     disk_manager_->ReadPage(page_id, pages_[frame_id].data_);
+130     pages_[frame_id].pin_count_ = 1;
+131     pages_[frame_id].page_id_ = page_id;
+132     replacer_->Pin(frame_id);
+133     latch_.unlock();
+134     return &pages_[frame_id];
+135   }
+136   if (!replacer_->Victim(&frame_id)) {
+137     latch_.unlock();
+138     return nullptr;
+139   }
+140   if (pages_[frame_id].IsDirty()) {
+141     page_id_t flush_page_id = pages_[frame_id].page_id_;
+142     pages_[frame_id].is_dirty_ = false;
+143     disk_manager_->WritePage(flush_page_id, pages_[frame_id].GetData());
+144   }
+145   page_table_.erase(pages_[frame_id].page_id_);
+146   page_table_[page_id] = frame_id;
+147   pages_[frame_id].page_id_ = page_id;
+148   disk_manager_->ReadPage(page_id, pages_[frame_id].data_);
+149   pages_[frame_id].pin_count_ = 1;
+150   replacer_->Pin(frame_id);
+151   latch_.unlock();
+152   return &pages_[frame_id];
+153 }
+```
+
+FetchPgImp的功能是获取对应页面ID的页面，并返回指向该页面的指针，这个函数实现了缓冲池管理的核心功能之一，即将页面从磁盘加载到内存，同时处理缓冲池满的情况下的页面替换逻辑。其由以下步骤组成：
+
+- 首先，通过检查page_table_以检查缓冲池中是否已经缓冲该页面，如果已经缓冲该页面，则直接返回该页面，并将该页面的用户数pin_count_递增以及调用replacer_的Pin方法；
+- 如缓冲池中尚未缓冲该页面，则需寻找当前缓冲池中是否存在空闲槽位或存放页面可被驱逐的槽位（下文称其为目标槽位），该流程与NewPgImp中的对应流程相似，唯一不同的则是传入目标槽位的page_id为函数参数而非由AllocatePage()分配得到。
+- **概括：**
+   - 查找页面：通过page_table_哈希表检查请求的页面是否已在缓冲池中，如果页面已存在，则获取其帧ID，增加引用计数，将其标记为被固定，然后返回页面指针
+   - 如果页面不在缓冲池中，需要加载：首先检查是否有空闲帧（free_list_），如果有空闲帧，从空闲列表中获取一个帧，如果没有空闲帧，则使用替换策略（replacer_）找一个可以替换的帧，如果无法找到可替换的帧（所有页面都被固定），则返回nullptr
+   - 准备帧存放新页面：如果选中的帧包含脏页，将其写回磁盘，从页表中移除旧页面ID到帧的映射，添加新页面ID到帧的映射，更新帧中页面的元数据（页面ID、引用计数等）
+   - 加载页面内容：从磁盘读取请求的页面内容到选中的帧，将帧标记为被固定，设置引用计数为1
+   - 释放锁并返回：释放互斥锁，返回加载好的页面指针
+
 **结构**
 
 <img src="https://github.com/user-attachments/assets/30dc7a14-aa59-4882-9e32-054b79b0cc5c" 
