@@ -579,6 +579,77 @@ FetchPgImp的功能是获取对应页面ID的页面，并返回指向该页面�
    - 加载页面内容：从磁盘读取请求的页面内容到选中的帧，将帧标记为被固定，设置引用计数为1
    - 释放锁并返回：释放互斥锁，返回加载好的页面指针
 
+
+```
+155 bool BufferPoolManagerInstance::DeletePgImp(page_id_t page_id) {
+156   // 0.   Make sure you call DeallocatePage!
+157   // 1.   Search the page table for the requested page (P).
+158   // 1.   If P does not exist, return true.
+159   // 2.   If P exists, but has a non-zero pin-count, return false. Someone is using the page.
+160   // 3.   Otherwise, P can be deleted. Remove P from the page table, reset its metadata and return it to the free list.
+161   DeallocatePage(page_id);
+162   latch_.lock();
+163   if (page_table_.count(page_id) == 0U) {
+164     latch_.unlock();
+165     return true;
+166   }
+167   frame_id_t frame_id;
+168   frame_id = page_table_[page_id];
+169   if (pages_[frame_id].pin_count_ != 0) {
+170     latch_.unlock();
+171     return false;
+172   }
+173   if (pages_[frame_id].IsDirty()) {
+174     page_id_t flush_page_id = pages_[frame_id].page_id_;
+175     pages_[frame_id].is_dirty_ = false;
+176     disk_manager_->WritePage(flush_page_id, pages_[frame_id].GetData());
+177   }
+178   page_table_.erase(page_id);
+179   pages_[frame_id].page_id_ = INVALID_PAGE_ID;
+180   free_list_.push_back(frame_id);
+181   latch_.unlock();
+182   return true;
+183 }
+```
+
+DeletePgImp的功能为从缓冲池中删除对应页面ID的页面，并将其插入空闲链表free_list_，其由以下步骤组成：
+- 首先，检查该页面是否存在于缓冲区，如未存在则返回True。然后，检查该页面的用户数pin_count_是否为0，如非0则返回False。在这里，不难看出DeletePgImp的返回值代表的是该页面是否被用户使用，因此在该页面不在缓冲区时也返回True；
+- 检查该页面是否为脏，如是则将其写回并将脏位设置为False。然后，在page_table_中删除该页面的映射，并将该槽位中页面的page_id置为INVALID_PAGE_ID。最后，将槽位ID插入空闲链表即可。
+
+```
+185 bool BufferPoolManagerInstance::UnpinPgImp(page_id_t page_id, bool is_dirty) {
+186   latch_.lock();
+187   frame_id_t frame_id;
+188   if (page_table_.count(page_id) != 0U) {
+189     frame_id = page_table_[page_id];
+190     pages_[frame_id].is_dirty_ |= is_dirty;
+191     if (pages_[frame_id].pin_count_ <= 0) {
+192       latch_.unlock();
+193       return false;
+194     }
+195     // std::cout<<"Unpin : pin_count = "<<pages_[frame_id].pin_count_<<std::endl;
+196     if (--pages_[frame_id].pin_count_ == 0) {
+197       replacer_->Unpin(frame_id);
+198     }
+199   }
+200   latch_.unlock();
+201   return true;
+202 }
+```
+
+这个UnpinPgImp函数实现了缓冲池管理器中"解除固定页面"的功能。它为提供用户向缓冲池通知页面使用完毕的接口，用户需声明使用完毕页面的页面ID以及使用过程中是否对该页面进行修改。其由以下步骤组成：
+
+- 首先，需检查该页面是否在缓冲池中，如未在缓冲池中则返回True。然后，检查该页面的用户数是否大于0，如不存在用户则返回false；
+- 递减该页面的用户数pin_count_，如在递减后该值等于0，则调用replacer_->Unpin以表示该页面可以被驱逐。
+- 流程如下：1.获取互斥锁以确保线程安全 ->2.检查请求的页面ID是否在页表中存在 ->3.如果存在，获取对应的帧ID ->4.更新脏状态 ->5.检查并减少引用计数 ->6.如果引用计数降为0，通知替换器该帧可以被替换 ->7.释放锁并返回结果
+- pages_[frame_id].is_dirty_ = pages_[frame_id].is_dirty_ | is_dirty;
+  - 这是一个非常巧妙的操作，它实现了"一旦脏就永远脏"的逻辑：
+  - 如果页面已经是脏的(is_dirty_ = true)，无论传入的is_dirty是什么，结果仍然是true
+  - 如果页面不是脏的(is_dirty_ = false)，那么最终结果取决于传入的is_dirty参数
+
+### Task3 : PARALLEL BUFFER POOL MANAGER
+
+
 **结构**
 
 <img src="https://github.com/user-attachments/assets/30dc7a14-aa59-4882-9e32-054b79b0cc5c" 
