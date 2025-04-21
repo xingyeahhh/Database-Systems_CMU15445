@@ -648,6 +648,39 @@ DeletePgImp的功能为从缓冲池中删除对应页面ID的页面，并将其�
   - 如果页面不是脏的(is_dirty_ = false)，那么最终结果取决于传入的is_dirty参数
 
 ### Task3 : PARALLEL BUFFER POOL MANAGER
+上述缓冲池实现的问题在于锁的粒度过大，其在进行任何一项操作时都将整个缓冲池锁住，因此几乎不存在并行性。在这里，并行缓冲池的思想是分配多个独立的缓冲池，并将不同的页面ID映射至各自的缓冲池中，从而减少整体缓冲池的锁粒度，以增加并行性。
+
+```
+ 25 class ParallelBufferPoolManager : public BufferPoolManager {
+...
+ 93  private:
+ 94   std::vector<BufferPoolManager *> instances_;
+ 95   size_t start_idx_{0};
+ 96   size_t pool_size_;
+ 97   size_t num_instances_;
+ 98 };
+```
+
+并行缓冲池的成员如上，instances_用于存储多个独立的缓冲池，pool_size_记录各缓冲池的容量，num_instances_为独立缓冲池的个数，start_idx见下文介绍。
+
+```
+ 18 ParallelBufferPoolManager::ParallelBufferPoolManager(size_t num_instances, size_t pool_size, Disk    Manager *disk_manager,
+ 19                                                      LogManager *log_manager)
+ 20     : pool_size_(pool_size), num_instances_(num_instances) {
+ 21   // Allocate and create individual BufferPoolManagerInstances
+ 22   for (size_t i = 0; i < num_instances; i++) {
+ 23     BufferPoolManager *tmp = new BufferPoolManagerInstance(pool_size, num_instances, i, disk_mana    ger, log_manager);
+ 24     instances_.push_back(tmp);
+ 25   }
+ 26 }
+ 27 
+ 28 // Update constructor to destruct all BufferPoolManagerInstances and deallocate any associated me    mory
+ 29 ParallelBufferPoolManager::~ParallelBufferPoolManager() {
+ 30   for (size_t i = 0; i < num_instances_; i++) {
+ 31     delete (instances_[i]);
+ 32   }
+ 33 }
+```
 
 
 **结构**
