@@ -1077,8 +1077,61 @@ Mask Structure: 00...011...1 (leading 0s + global_depth_ 1s).
  35 }
 ```
 
-GetValue提取桶中键为key的所有值，实现方法为遍历所有occupied_为1的位，并将键匹配的值插入result数组即可，如至少找到了一个对应值，则返回真。在这里，可以看出
+GetValue提取桶中键为key的所有值，实现方法为遍历所有occupied_为1的位，并将键匹配的值插入result数组即可，如至少找到了一个对应值，则返回真。
 
+```
+ 37 template <typename KeyType, typename ValueType, typename KeyComparator>
+ 38 bool HASH_TABLE_BUCKET_TYPE::Insert(KeyType key, ValueType value, KeyComparator cmp) {
+ 39   size_t slot_idx = 0;                                 // 记录可用槽位的索引
+ 40   bool slot_found = false;                             // 是否找到可用槽位
+
+ 41   for (size_t bucket_idx = 0; bucket_idx < BUCKET_ARRAY_SIZE; bucket_idx++) {
+ 42     if (!slot_found && (!IsReadable(bucket_idx) || !IsOccupied(bucket_idx))) {
+ 43       slot_found = true;
+ 44       slot_idx = bucket_idx;
+ 45       // LOG_DEBUG("slot_idx = %ld", bucket_idx);
+
+          //条件：未找到可用槽位 且 当前槽位是墓碑（!IsReadable）或未占用（!IsOccupied）
+          //操作：记录第一个可用槽位的索引 slot_idx，并标记 slot_found
+ 46     }
+ 47     if (!IsOccupied(bucket_idx)) {
+ 48       break;          //遇到未占用的槽位（即完全空闲的槽位）时终止遍历（因为插入是从低到高填充的）
+ 49     }
+ 50     if (IsReadable(bucket_idx) && cmp(key, KeyAt(bucket_idx)) == 0 && value == ValueAt(bucket_idx)) {   //槽位有效，键匹配，值匹配
+ 51       return false;   //操作：如果完全相同的键值对已存在，直接返回 false（拒绝重复插入）
+ 52     }
+ 53   }
+
+ 54   if (slot_found) {
+ 55     SetReadable(slot_idx);                          // 标记为有效
+ 56     SetOccupied(slot_idx);                          // 标记为占用
+ 57     array_[slot_idx] = MappingType(key, value);     // 存储数据
+ 58     return true;                                    // 表示插入成功
+ 59   }
+
+ 60   return false;                                     // 遍历完所有槽位仍未找到可用位置（桶已满），返回 false
+ 61 }
+```
+![image](https://github.com/user-attachments/assets/d4a8152e-fc10-4075-98dc-b023b282d0a2)
+
+
+Insert向桶插入键值对，其先检测该键值对是否已经被插入到桶中，如是则返回假；如未找到该键值对，则从小到大遍历所有occupied_为1的位，如出现readable_为1的位，则在array_中对应的数组中插入键值对。由于此种插入特性，因此occupied_为1的位是连续的，因此occupied_的功能与一个size参数是等价的。在这里仍然采用occupied_数组的原因可能是提供静态哈希表的实现兼容性（静态哈希表采用线性探测法解决散列冲突，因此必须使用occupied_数组）。
+
+```
+ 63 template <typename KeyType, typename ValueType, typename KeyComparator>
+ 64 bool HASH_TABLE_BUCKET_TYPE::Remove(KeyType key, ValueType value, KeyComparator cmp) {
+ 65   for (size_t bucket_idx = 0; bucket_idx < BUCKET_ARRAY_SIZE; bucket_idx++) {
+ 66     if (!IsOccupied(bucket_idx)) {
+ 67       break;
+ 68     }
+ 69     if (IsReadable(bucket_idx) && cmp(key, KeyAt(bucket_idx)) == 0 && value == ValueAt(bucket_idx    )) {
+ 70       RemoveAt(bucket_idx);
+ 71       return true;
+ 72     }
+ 73   }
+ 74   return false;
+ 75 }
+```
 
 
 
