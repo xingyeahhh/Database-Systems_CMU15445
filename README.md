@@ -1242,13 +1242,32 @@ HashTableBucketPage* bucket_page = reinterpret_cast<HashTableBucketPage*>(page->
    
 
 - 4. 完整查询流程示例
-
-<img src="![image](https://github.com/user-attachments/assets/236d6fa5-ca36-486f-83fd-eebb72b1ea64)" 
+ 
+<img src="https://github.com/user-attachments/assets/2c91aa43-5ba7-48aa-b6ba-7aff3c6723a7" 
      alt="image" 
-     style="width:50%; max-width:600px;">
+     style="width:70%; max-width:600px;">
 
+- 5. 分裂与合并时的序号变化
+  - 桶分裂（Split）
+    - 当桶满时，根据局部深度（local_depth）增加位数：原 bucket_idx=0b10（local_depth=2）→ 分裂为 0b010 和 0b110（local_depth=3）。
+    - 目录扩展：全局深度增加时，目录项数量翻倍，但物理页面可能共享（直到实际分裂）。
 
+  - 桶合并（Merge）
+    - 当两个兄弟桶的 local_depth 相同且可合并时：
+      - 例如 0b010 和 0b110（local_depth=3）→ 合并为 0b10（local_depth=2）。
+    - 目录收缩：如果所有桶的 local_depth < global_depth，可以缩减全局深度。
+   
+- 6. 为什么需要逻辑与物理分离？
+  - 动态扩展：目录可以动态增长/收缩，而物理页面独立分配。
+  - 空间优化：多个逻辑桶可能指向同一物理页面（分裂初期共享页面）。
+  - 并发控制：通过 Page 类的锁（rwlatch_）保护物理页面，与逻辑结构解耦。
 
+- bucket_idx：逻辑序号，由哈希值和全局深度计算得到。
+- page_id：物理页面标识，通过目录页映射。
+- slot_idx：桶内槽位序号，与 bucket_idx 无关。
+- 转换链：
+  - Key → bucket_idx → page_id → Page → HashTableBucketPage → slot_idx
+- **这种设计实现了逻辑层（可扩展哈希）与物理层（页面存储）的优雅解耦，是数据库系统高效管理的核心机制之一**
 
 ## Task 2,3 : HASH TABLE IMPLEMENTATION + CONCURRENCY CONTROL
 
