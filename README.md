@@ -953,19 +953,72 @@ Mask Structure: 00...011...1 (leading 0s + global_depth_ 1s).
     - 实际内存布局中，array_ 会紧跟在 occupied_ 和 readable_ 之后，动态扩展以存储数据。
     - 通过指针算术访问具体槽位（如 array_[i]）。
 
--**如何检查槽位**
+- **如何检查槽位**
   - 比如要检查第n个槽位是否被占用，代码会:
   - 计算这个槽位对应的是哪个字节: byte_index = n / 8
   - 计算这个槽位对应的是字节中的哪一位: bit_index = n % 8
   - 通过位操作检查: (readable_[byte_index] & (1 << bit_index)) != 0
     - 这种设计的优点是非常节省内存 - 如果有10000个槽位，只需要约1250字节(10000/8)来存储所有槽位的状态，而不是10000字节。
 
--**内存布局**
+- **内存布局**
 - **| occupied_ (bitmap) | readable_ (bitmap) | array_ (flexible K/V pairs) |**
   - 这样设计允许哈希桶在一块连续内存中存储管理信息(occupied_和readable_)和实际的键值对数据(array_)
   - occupied_ 和 readable_ 是紧凑的位图，用于高效管理槽位状态。array_ 是变长部分，实际存储所有键值对。
     - 插入数据：找到一个 occupied_=0 的槽位（或 readable_=0 的墓碑位置）。设置 occupied_=1 和 readable_=1，写入 array_[i]。
     - 删除数据：不实际擦除数据，而是设置 readable_=0（逻辑删除，成为墓碑）。
     - 查询数据：检查 readable_=1 的槽位，比较键值。
+
+```
+ 87 template <typename KeyType, typename ValueType, typename KeyComparator>
+ 88 void HASH_TABLE_BUCKET_TYPE::RemoveAt(uint32_t bucket_idx) {
+ 89   readable_[bucket_idx / 8] &= ~(1 << (7 - (bucket_idx % 8)));
+ 90 }
+ 91 
+ 92 template <typename KeyType, typename ValueType, typename KeyComparator>
+ 93 bool HASH_TABLE_BUCKET_TYPE::IsOccupied(uint32_t bucket_idx) const {
+ 94   return (occupied_[bucket_idx / 8] & (1 << (7 - (bucket_idx % 8)))) != 0;
+ 95 }
+ 96 
+ 97 template <typename KeyType, typename ValueType, typename KeyComparator>
+ 98 void HASH_TABLE_BUCKET_TYPE::SetOccupied(uint32_t bucket_idx) {
+ 99   occupied_[bucket_idx / 8] |= 1 << (7 - (bucket_idx % 8));
+100 }
+101 
+102 template <typename KeyType, typename ValueType, typename KeyComparator>
+103 bool HASH_TABLE_BUCKET_TYPE::IsReadable(uint32_t bucket_idx) const {
+104   return (readable_[bucket_idx / 8] & (1 << (7 - (bucket_idx % 8)))) != 0;
+105 }
+106 
+107 template <typename KeyType, typename ValueType, typename KeyComparator>
+108 void HASH_TABLE_BUCKET_TYPE::SetReadable(uint32_t bucket_idx) {
+109   readable_[bucket_idx / 8] |= 1 << (7 - (bucket_idx % 8));
+110 }
+```
+
+- **RemoveAt（逻辑删除槽位）**
+- readable_[bucket_idx / 8] &= ~(1 << (7 - (bucket_idx % 8)));
+  - 作用：将指定槽位标记为逻辑删除（墓碑）（readable_位设为 0）。
+  - 操作：
+    - bucket_idx / 8：找到目标槽位所在的字节索引（每字节管理8个槽位）。
+    - bucket_idx % 8：计算槽位在字节中的位偏移（0~7）。
+    - 1 << (7 - (bucket_idx % 8))：生成掩码（如 bucket_idx=2 → 00100000）。
+    - ~(...)：按位取反（如 00100000 → 11011111）。
+    - &=：清除目标位（其他位保持不变）。
+
+
+- **2. IsOccupied（检查槽位是否被占用）**
+- return (occupied_[bucket_idx / 8] & (1 << (7 - (bucket_idx % 8)))) != 0;
+- 作用：判断槽位是否被物理占用（即使数据已删除）。
+- 操作：
+  - 同上计算字节索引和位偏移。
+  - occupied_[...] & (1 << ...)：提取目标位。
+  - != 0：若结果为 1，返回 true。
+
+
+
+
+
+
+
 
 
