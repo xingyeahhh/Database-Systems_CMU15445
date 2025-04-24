@@ -1034,7 +1034,7 @@ Mask Structure: 00...011...1 (leading 0s + global_depth_ 1s).
 - 操作：与 SetOccupied 类似。
 
 
-对于对应索引的键值读取直接访问arrat_数组即可：
+😺对于对应索引的键值读取直接访问arrat_数组即可：
 ```
  77 template <typename KeyType, typename ValueType, typename KeyComparator>
  78 KeyType HASH_TABLE_BUCKET_TYPE::KeyAt(uint32_t bucket_idx) const {
@@ -1049,20 +1049,35 @@ Mask Structure: 00...011...1 (leading 0s + global_depth_ 1s).
 
 ```
  22 template <typename KeyType, typename ValueType, typename KeyComparator>
- 23 bool HASH_TABLE_BUCKET_TYPE::GetValue(KeyType key, KeyComparator cmp, std::vector<ValueType> *result) {
+ 23 bool HASH_TABLE_BUCKET_TYPE::GetValue(
+    KeyType key,                    // 要查找的键
+    KeyComparator cmp,              // 键比较器（用于比较键是否相等）
+    std::vector<ValueType> *result  // 输出参数：存储匹配的值
+    ) {
  24   bool ret = false;
  25   for (size_t bucket_idx = 0; bucket_idx < BUCKET_ARRAY_SIZE; bucket_idx++) {
  26     if (!IsOccupied(bucket_idx)) {
- 27       break;
+ 27       break;                    //若遇到未占用的槽位，说明后续槽位均为空，直接终止遍历（因为插入时是从低索引到高索引填充的
  28     }
  29     if (IsReadable(bucket_idx) && cmp(key, KeyAt(bucket_idx)) == 0) {
+
+          //IsReadable(bucket_idx)：检查槽位是否有效（非墓碑状态）。
+          //KeyAt(bucket_idx)：获取槽位中存储的键（实际是 array_[bucket_idx].first）
+          //cmp(key, KeyAt(...)) == 0：用比较器判断键是否相等
+          //只有有效且键匹配的槽位会被处理
+
  30       result->push_back(array_[bucket_idx].second);
  31       ret = true;
+
+          //将匹配的值（array_[bucket_idx].second）存入结果向量 result。
+          //设置返回值 ret = true（表示至少找到一个匹配项）。
  32     }
  33   }
  34   return ret;
  35 }
 ```
+
+GetValue提取桶中键为key的所有值，实现方法为遍历所有occupied_为1的位，并将键匹配的值插入result数组即可，如至少找到了一个对应值，则返回真。在这里，可以看出
 
 
 
