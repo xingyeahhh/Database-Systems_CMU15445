@@ -870,6 +870,20 @@ DeletePgImp的功能为从缓冲池中删除对应页面ID的页面，并将其�
 
 ```
 
+该页面类作为哈希表的目录页面，保存哈希表中使用的所有元数据，包括该页面的页面ID，日志序列号以及哈希表的全局深度、局部深度及各目录项所指向的桶的页面ID。在本实验中，GetSplitImageIndex和GetLocalHighBit两个与分裂映像相关的概念并未用到，个人认为此概念并不关键。下面将展示一些稍有难度的函数实现：
 
-
+```
+ 29 uint32_t HashTableDirectoryPage::GetGlobalDepthMask() { return (1U << global_depth_) - 1; }
+...
+ 47 bool HashTableDirectoryPage::CanShrink() {
+ 48   uint32_t bucket_num = 1 << global_depth_;
+ 49   for (uint32_t i = 0; i < bucket_num; i++) {
+ 50     if (local_depths_[i] == global_depth_) {
+ 51       return false;
+ 52     }
+ 53   }
+ 54   return true;
+ 55 }
+```
+GetGlobalDepthMask通过位运算返回用于计算全局深度低位的掩码；CanShrink()检查当前所有有效目录项的局部深度是否均小于全局深度，以判断是否可以进行表合并。
 
