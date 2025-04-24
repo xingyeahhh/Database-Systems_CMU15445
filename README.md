@@ -1269,7 +1269,7 @@ HashTableBucketPage* bucket_page = reinterpret_cast<HashTableBucketPage*>(page->
   - Key → bucket_idx → page_id → Page → HashTableBucketPage → slot_idx
 - **这种设计实现了逻辑层（可扩展哈希）与物理层（页面存储）的优雅解耦，是数据库系统高效管理的核心机制之一**
 
-## Task 2,3 : HASH TABLE IMPLEMENTATION + CONCURRENCY CONTROL
+### Task 2,3 : HASH TABLE IMPLEMENTATION + CONCURRENCY CONTROL
 
 
 
