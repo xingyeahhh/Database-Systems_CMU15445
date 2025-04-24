@@ -1205,6 +1205,50 @@ HashTableBucketPage* bucket_page = reinterpret_cast<HashTableBucketPage*>(page->
 - 所有页面统一分配/释放，减少内存碎片。
 - 类型安全: 通过模板和静态断言确保类型转换的安全性： static_assert(offsetof(HashTableBucketPage, array_) == 0); // 必须与data_对齐
 
+**哈希桶的序号（Bucket Index）与Page的物理存储之间的关系确实需要明确**
+- 1. 哈希桶序号的本质
+  - 哈希桶的序号（即 bucket_idx）是逻辑标识符，它通过以下步骤与物理页面关联：
+  - 计算哈希值：对键（Key）哈希得到整数值。
+  - 提取低N位：用全局深度（global_depth）决定取哈希值的低几位作为 bucket_idx
+  - uint32_t bucket_idx = Hash(key) & GetGlobalDepthMask(); // 例如 mask=0b11（global_depth=2，0b代表二进制）
+  - 映射到物理页面：通过目录页（DirectoryPage）将 bucket_idx 转换为实际的 page_id
+
+- 2. 目录页的核心作用
+  - 目录页（HashTableDirectoryPage）存储了逻辑桶序号到物理页面的映射表：
+  - class HashTableDirectoryPage {
+
+    page_id_t bucket_page_ids_[DIRECTORY_ARRAY_SIZE]; // 每个bucket_idx对应的物理page_id
+
+    uint8_t local_depths_[DIRECTORY_ARRAY_SIZE];      // 每个桶的局部深度
+
+    // ...
+};
+
+- 3. 物理页面中的桶数据存储
+  - 转换后的 HashTableBucketPage 在 Page::data_ 中的布局如下：
+
+  - class HashTableBucketPage {
+    
+      char occupied_[];    // 位图，标记槽位是否被占用
+    
+      char readable_[];    // 位图，标记槽位是否有效
+    
+      MappingType array_[]; // 实际键值对数组
+    
+  };
+
+  - array_ 的索引：即桶内的槽位序号（slot_idx），与 bucket_idx 无关。 例如：bucket_idx=3 的物理页面内部可能有多个槽位（slot_idx=0,1,2,...）
+ 
+   
+
+- 4. 完整查询流程示例
+
+<img src="https://github.com/user-attachments/assets/d4a8152e-fc10-4075-98dc-b023b282d0a2" 
+     alt="image" 
+     style="width:50%; max-width:600px;">
+
+
+
 
 ## Task 2,3 : HASH TABLE IMPLEMENTATION + CONCURRENCY CONTROL
 
