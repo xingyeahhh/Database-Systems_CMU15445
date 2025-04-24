@@ -1243,7 +1243,7 @@ HashTableBucketPage* bucket_page = reinterpret_cast<HashTableBucketPage*>(page->
 
 - 4. 完整查询流程示例
 
-<img src="https://github.com/user-attachments/assets/d4a8152e-fc10-4075-98dc-b023b282d0a2" 
+<img src="![image](https://github.com/user-attachments/assets/236d6fa5-ca36-486f-83fd-eebb72b1ea64)" 
      alt="image" 
      style="width:50%; max-width:600px;">
 
