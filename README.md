@@ -1126,7 +1126,7 @@ Insert向桶插入键值对，其先检测该键值对是否已经被插入到�
  66     if (!IsOccupied(bucket_idx)) {
  67       break;
  68     }
- 69     if (IsReadable(bucket_idx) && cmp(key, KeyAt(bucket_idx)) == 0 && value == ValueAt(bucket_idx    )) {
+ 69     if (IsReadable(bucket_idx) && cmp(key, KeyAt(bucket_idx)) == 0 && value == ValueAt(bucket_idx)) {
  70       RemoveAt(bucket_idx);
  71       return true;
  72     }
@@ -1134,6 +1134,83 @@ Insert向桶插入键值对，其先检测该键值对是否已经被插入到�
  74   return false;
  75 }
 ```
+
+Remove从桶中删除对应的键值对，遍历桶所有位即可。
+
+```
+112 template <typename KeyType, typename ValueType, typename KeyComparator>
+113 bool HASH_TABLE_BUCKET_TYPE::IsFull() {
+114   return NumReadable() == BUCKET_ARRAY_SIZE;   //检查桶中有效键值对的数量是否达到容量上限
+115 }
+116 
+117 template <typename KeyType, typename ValueType, typename KeyComparator>
+118 uint32_t HASH_TABLE_BUCKET_TYPE::NumReadable() {
+119   uint32_t ret = 0;
+120   for (size_t bucket_idx = 0; bucket_idx < BUCKET_ARRAY_SIZE; bucket_idx++) {
+121     if (!IsOccupied(bucket_idx)) {
+122       break;        //遇到第一个 !IsOccupied 的槽位时直接 break（因为插入是顺序填充的，后续槽位必然为空）
+123     }
+124     if (IsReadable(bucket_idx)) {
+125       ret++;        //仅当 IsReadable(bucket_idx) 为 true 时（非墓碑），计数器 ret 增加
+126     }
+127   }
+128   return ret;
+129 } 
+130     
+131 template <typename KeyType, typename ValueType, typename KeyComparator>
+132 bool HASH_TABLE_BUCKET_TYPE::IsEmpty() {
+133   return NumReadable() == 0;  //若 NumReadable() 返回 0，表示桶中无有效数据（可能全为墓碑或完全空闲），返回 true
+134 }
+```
+
+NumReadable()返回桶中的键值对个数，遍历即可。IsFull()和IsEmpty()直接复用NumReadable()实现。
+
+**Page与上述两个页面类的转换，页面（Page）与具体页面类型（如HashTableDirectoryPage/HashTableBucketPage）之间的类型转换机制，这是数据库存储引擎设计的核心技巧之一**
+
+在本部分中，有难点且比较巧妙的地方在于理解上述两个页面类是如何与Page类型转换的。在这里，上述两个页面类并非未Page类的子类，在实际应用中通过reinterpret_cast将Page与两个页面类进行转换。在这里我们回顾一下Page的数据成员：
+
+```
+ 77  private:
+ 78   /** Zeroes out the data that is held within the page. */
+ 79   inline void ResetMemory() { memset(data_, OFFSET_PAGE_START, PAGE_SIZE); }
+ 80 
+ 81   /** The actual data that is stored within a page. */
+ 82   char data_[PAGE_SIZE]{};
+ 83   /** The ID of this page. */
+ 84   page_id_t page_id_ = INVALID_PAGE_ID;
+ 85   /** The pin count of this page. */
+ 86   int pin_count_ = 0;
+ 87   /** True if the page is dirty, i.e. it is different from its corresponding page on disk. */
+ 88   bool is_dirty_ = false;
+ 89   /** Page latch. */
+ 90   ReaderWriterLatch rwlatch_;
+ 91 };
+```
+
+可以看出，Page中用于存放实际数据的data_数组位于数据成员的第一位，其在栈区固定分配一个页面的大小。因此，在Page与两个页面类强制转换时，通过两个页面类的指针的操作仅能影响到data_中的实际数据，而影响不到其它元数据。并且在内存管理器中始终是进行所占空间更大的通用页面Page的分配（实验中的NewPage），因此页面的容量总是足够的。
+
+- 核心设计思想
+  - 统一内存管理：数据库系统使用通用的 Page 类作为所有页面的基础容器，负责内存分配、磁盘I/O和并发控制。
+  - 类型擦除：具体的页面类型（如哈希表目录页、桶页）通过强制类型转换复用 Page 的 data_ 空间，实现"一片内存，多种解释"
+ 
+```
+// 将Page*转换为具体页面类*
+HashTableBucketPage* bucket_page = reinterpret_cast<HashTableBucketPage*>(page->GetData());
+```
+- GetData() 返回 data_ 的起始地址（即 Page 对象起始地址）。
+- 通过 reinterpret_cast 将 char[] 内存重新解释为具体页面类。
+- Page 类：负责物理层管理（内存/磁盘、并发控制、脏页标记）。
+- 具体页面类：负责逻辑层数据结构（如哈希表的目录/桶逻辑）。
+- 避免多重继承带来的开销。
+- 所有页面统一分配/释放，减少内存碎片。
+- 类型安全: 通过模板和静态断言确保类型转换的安全性： static_assert(offsetof(HashTableBucketPage, array_) == 0); // 必须与data_对齐
+
+
+## Task 2,3 : HASH TABLE IMPLEMENTATION + CONCURRENCY CONTROL
+
+
+
+
 
 
 
