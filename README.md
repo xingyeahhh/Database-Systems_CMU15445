@@ -836,7 +836,7 @@ DeletePgImp的功能为从缓冲池中删除对应页面ID的页面，并将其�
 
 ![image](https://github.com/user-attachments/assets/f41bcbc9-c85a-40b9-87fe-0837ba496b91)
 
-当哈希桶合并后使得所有目录项的局部深度均小于全局深度时，既可以进行哈希表的收缩。在这里可以体现低位可拓展哈希表，即收缩哈希表仅需将全局深度减一即可，而不需改变其余任何哈希表的元数据。下图展示了哈希表收缩后的形态：
+当哈希桶合并后使得所有目录项的局部深度均小于全局深度时，既可以进行**哈希表的收缩**。在这里可以体现低位可拓展哈希表，即**收缩哈希表**仅需将全局深度减一即可，而不需改变其余任何哈希表的元数据。下图展示了哈希表收缩后的形态：
 
 ![image](https://github.com/user-attachments/assets/c567b100-078e-45cb-b23f-1eca0873f5ed)
 
@@ -885,7 +885,12 @@ DeletePgImp的功能为从缓冲池中删除对应页面ID的页面，并将其�
  54   return true;
  55 }
 ```
-GetGlobalDepthMask通过位运算返回用于计算全局深度低位的掩码；CanShrink()检查当前所有有效目录项的局部深度是否均小于全局深度，以判断是否可以进行表合并。
+GetGlobalDepthMask通过位运算返回用于计算全局深度低位的掩码；CanShrink()检查当前所有有效目录项的局部深度是否均小于全局深度，以判断是否可以进行表合并，哈希表的收缩上文图表有演示：
+- 计算当前目录中的桶数量：bucket_num = 1 << global_depth_（即2的global_depth_次方）
+- 遍历所有桶
+- 检查每个桶的本地深度（local_depths_[i]）是否等于全局深度（global_depth_）
+- 如果有任何一个桶的本地深度等于全局深度，则返回false，表示不能缩小
+- 如果所有桶的本地深度都小于全局深度，则返回true，表示可以缩小
 
 This code generates a bitmask where the lowest global_depth_ bits are set to 1, and all higher bits are 0. Here’s a detailed breakdown:
 
@@ -903,3 +908,64 @@ Mask Structure: 00...011...1 (leading 0s + global_depth_ 1s).
 - Why Use Unsigned 1U?
   - Avoids Undefined Behavior: If 1 (signed) is used, left-shifting by large values (e.g., 31) could trigger undefined behavior (UB). 1U ensures safe shifting.
   - Consistent Wrapping: Unsigned subtraction wraps around predictably (e.g., 0U - 1 = 0xFFFFFFFF), unlike signed integers.
+
+
+**HashTableBucketPage**
+```
+ 37 template <typename KeyType, typename ValueType, typename KeyComparator>
+ 38 class HashTableBucketPage {
+ 39  public:
+...
+141  private:
+142   // For more on BUCKET_ARRAY_SIZE see storage/page/hash_table_page_defs.h
+143   char occupied_[(BUCKET_ARRAY_SIZE - 1) / 8 + 1];
+144   // 0 if tombstone/brand new (never occupied), 1 otherwise.
+145   char readable_[(BUCKET_ARRAY_SIZE - 1) / 8 + 1];
+146   // Do not add any members below array_, as they will overlap.
+147   MappingType array_[0];
+```
+
+用到了bitmap, 该页面类用于存放哈希桶的键值与存储值对，以及桶的槽位状态数据。occupied_数组用于统计桶中的槽是否被使用过，当一个槽被插入键值对时，其对应的位被置为1，事实上，occupied_完全可以被一个size参数替代，但由于测试用例中需要检测对应的occupied值，因此在这里仍保留该数组；readable_数组用于标记桶中的槽是否被占用，当被占用时该值被置为1，否则置为0；array_是C++中一种弹性数组的写法，在这里只需知道它用于存储实际的键值对即可。
+
+在这里，使用char类型存放两个状态数据数组，在实际使用应当按位提取对应的状态位。下面是使用位运算的状态数组读取和设置函数；
+
+- **char occupied_[(BUCKET_ARRAY_SIZE - 1) / 8 + 1]**
+  - 作用：标记某个槽位（slot）是否被占用（即使数据已被删除或无效）;
+  - 位图(Bitmap)的原理: 在这种实现中，每个槽位的状态只需要1个比特位就可以表示（0或1），为了节省内存，代码使用了位压缩技术 - 每个char(8位)可以存储8个槽位的状态;
+  - 实现：
+    - 是一个位图（bitmap），每个 char（1字节 = 8位）表示 8 个槽位的占用状态;
+    - (BUCKET_ARRAY_SIZE - 1) / 8 + 1 计算需要多少字节才能覆盖所有槽位（向上取整）;
+    - 例如，BUCKET_ARRAY_SIZE=10 → 需要 2 字节（16位），其中 10 位有效;
+    - 例如，(BUCKET_ARRAY_SIZE - 1) / 8 + 1 这个公式计算需要多少个字节来存储所有槽位的状态，假设BUCKET_ARRAY_SIZE是100: (100-1)/8 = 12.375，向上取整得13，这样用13个字节(13*8=104位)就可以表示所有100个槽位的状态;
+
+- **char readable_[(BUCKET_ARRAY_SIZE - 1) / 8 + 1]**
+  - 作用：标记某个槽位的数据是否有效（非墓碑/非未初始化状态）;
+    - 0：表示该槽位是墓碑（tombstone）或从未被占用（逻辑删除或未使用）;
+    - 1：表示该槽位的数据是有效的（可读取）;
+  - 和 occupied_ 的区别：
+    - occupied_ 标记物理占用（即使数据被删除也会保持 1）;
+    - readable_ 标记逻辑有效性（删除后设为 0）;
+
+- **MappingType array_[0]**
+  - 作用：实际存储键值对（KeyType + ValueType）的柔性数组（flexible array）。
+  - 特点：
+    - array_[0] 是 C/C++ 中的零长度数组技巧，表示数组大小在运行时确定。
+    - 实际内存布局中，array_ 会紧跟在 occupied_ 和 readable_ 之后，动态扩展以存储数据。
+    - 通过指针算术访问具体槽位（如 array_[i]）。
+
+-**如何检查槽位**
+  - 比如要检查第n个槽位是否被占用，代码会:
+  - 计算这个槽位对应的是哪个字节: byte_index = n / 8
+  - 计算这个槽位对应的是字节中的哪一位: bit_index = n % 8
+  - 通过位操作检查: (readable_[byte_index] & (1 << bit_index)) != 0
+    - 这种设计的优点是非常节省内存 - 如果有10000个槽位，只需要约1250字节(10000/8)来存储所有槽位的状态，而不是10000字节。
+
+-**内存布局**
+- **| occupied_ (bitmap) | readable_ (bitmap) | array_ (flexible K/V pairs) |**
+  - 这样设计允许哈希桶在一块连续内存中存储管理信息(occupied_和readable_)和实际的键值对数据(array_)
+  - occupied_ 和 readable_ 是紧凑的位图，用于高效管理槽位状态。array_ 是变长部分，实际存储所有键值对。
+    - 插入数据：找到一个 occupied_=0 的槽位（或 readable_=0 的墓碑位置）。设置 occupied_=1 和 readable_=1，写入 array_[i]。
+    - 删除数据：不实际擦除数据，而是设置 readable_=0（逻辑删除，成为墓碑）。
+    - 查询数据：检查 readable_=1 的槽位，比较键值。
+
+
