@@ -887,3 +887,19 @@ DeletePgImp的功能为从缓冲池中删除对应页面ID的页面，并将其�
 ```
 GetGlobalDepthMask通过位运算返回用于计算全局深度低位的掩码；CanShrink()检查当前所有有效目录项的局部深度是否均小于全局深度，以判断是否可以进行表合并。
 
+This code generates a bitmask where the lowest global_depth_ bits are set to 1, and all higher bits are 0. Here’s a detailed breakdown:
+
+ - (1) 1U << global_depth_
+   - 1U is an unsigned integer literal (unsigned int), ensuring safe bit shifting without unexpected sign-bit behavior.
+   - << global_depth_ performs a left shift of 1U by global_depth_ bits.
+   - Example: If global_depth_ = 3: Binary of 1U: 000...0001 (32 bits). After left shift by 3: 000...1000 (decimal 8, since 1 << 3 = 8).
+
+- (2) - 1
+  - Subtracting 1 from the shifted value sets the lowest global_depth_ bits to 1:
+  - Continuing the global_depth_ = 3 example: 8 - 1 = 7, binary 000...0111 (lowest 3 bits are 1).
+
+- Purpose of the Mask
+Mask Structure: 00...011...1 (leading 0s + global_depth_ 1s).
+- Why Use Unsigned 1U?
+  - Avoids Undefined Behavior: If 1 (signed) is used, left-shifting by large values (e.g., 31) could trigger undefined behavior (UB). 1U ensures safe shifting.
+  - Consistent Wrapping: Unsigned subtraction wraps around predictably (e.g., 0U - 1 = 0xFFFFFFFF), unlike signed integers.
