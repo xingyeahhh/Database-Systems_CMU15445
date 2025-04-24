@@ -995,7 +995,7 @@ Mask Structure: 00...011...1 (leading 0s + global_depth_ 1s).
 110 }
 ```
 
-- **RemoveAt（逻辑删除槽位）**
+**RemoveAt（逻辑删除槽位）**
 - readable_[bucket_idx / 8] &= ~(1 << (7 - (bucket_idx % 8)));
   - 作用：将指定槽位标记为逻辑删除（墓碑）（readable_位设为 0）。
   - 操作：
@@ -1006,18 +1006,63 @@ Mask Structure: 00...011...1 (leading 0s + global_depth_ 1s).
     - &=：清除目标位（其他位保持不变）。
 
 
-- **2. IsOccupied（检查槽位是否被占用）**
+**IsOccupied（检查槽位是否被占用）**
 - return (occupied_[bucket_idx / 8] & (1 << (7 - (bucket_idx % 8)))) != 0;
 - 作用：判断槽位是否被物理占用（即使数据已删除）。
 - 操作：
   - 同上计算字节索引和位偏移。
-  - occupied_[...] & (1 << ...)：提取目标位。
+  - occupied_[...] & (1 << ...)：提取目标位，（如 bucket_idx=2 → 00100000）。
   - != 0：若结果为 1，返回 true。
 
+ 
+**SetOccupied（标记槽位为占用）**
+- occupied_[bucket_idx / 8] |= 1 << (7 - (bucket_idx % 8));
+- 作用：强制标记槽位为已占用（用于插入新数据）。
+- 操作：
+  - |=：将目标位置 1（其他位不变）。
+
+ 
+**IsReadable（检查槽位是否有效）**
+- return (readable_[bucket_idx / 8] & (1 << (7 - (bucket_idx % 8)))) != 0;
+- 作用：判断槽位是否有效（非墓碑且数据可读）。
+- 逻辑：与 IsOccupied 类似，但操作的是 readable_ 位图。
 
 
+**SetReadable（标记槽位为有效）**
+- readable_[bucket_idx / 8] |= 1 << (7 - (bucket_idx % 8));
+- 作用：标记槽位为有效（用于插入或恢复数据）。
+- 操作：与 SetOccupied 类似。
 
 
+对于对应索引的键值读取直接访问arrat_数组即可：
+```
+ 77 template <typename KeyType, typename ValueType, typename KeyComparator>
+ 78 KeyType HASH_TABLE_BUCKET_TYPE::KeyAt(uint32_t bucket_idx) const {
+ 79   return array_[bucket_idx].first;
+ 80 }
+ 81 
+ 82 template <typename KeyType, typename ValueType, typename KeyComparator>
+ 83 ValueType HASH_TABLE_BUCKET_TYPE::ValueAt(uint32_t bucket_idx) const {
+ 84   return array_[bucket_idx].second;
+ 85 }
+```
+
+```
+ 22 template <typename KeyType, typename ValueType, typename KeyComparator>
+ 23 bool HASH_TABLE_BUCKET_TYPE::GetValue(KeyType key, KeyComparator cmp, std::vector<ValueType> *result) {
+ 24   bool ret = false;
+ 25   for (size_t bucket_idx = 0; bucket_idx < BUCKET_ARRAY_SIZE; bucket_idx++) {
+ 26     if (!IsOccupied(bucket_idx)) {
+ 27       break;
+ 28     }
+ 29     if (IsReadable(bucket_idx) && cmp(key, KeyAt(bucket_idx)) == 0) {
+ 30       result->push_back(array_[bucket_idx].second);
+ 31       ret = true;
+ 32     }
+ 33   }
+ 34   return ret;
+ 35 }
+```
 
 
 
