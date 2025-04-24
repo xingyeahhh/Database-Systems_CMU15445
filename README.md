@@ -1112,7 +1112,9 @@ GetValue提取桶中键为key的所有值，实现方法为遍历所有occupied_
  60   return false;                                     // 遍历完所有槽位仍未找到可用位置（桶已满），返回 false
  61 }
 ```
-![image](https://github.com/user-attachments/assets/d4a8152e-fc10-4075-98dc-b023b282d0a2)
+<img src="https://github.com/user-attachments/assets/d4a8152e-fc10-4075-98dc-b023b282d0a2" 
+     alt="image" 
+     style="width:50%; max-width:600px;">
 
 
 Insert向桶插入键值对，其先检测该键值对是否已经被插入到桶中，如是则返回假；如未找到该键值对，则从小到大遍历所有occupied_为1的位，如出现readable_为1的位，则在array_中对应的数组中插入键值对。由于此种插入特性，因此occupied_为1的位是连续的，因此occupied_的功能与一个size参数是等价的。在这里仍然采用occupied_数组的原因可能是提供静态哈希表的实现兼容性（静态哈希表采用线性探测法解决散列冲突，因此必须使用occupied_数组）。
