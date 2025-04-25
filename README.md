@@ -1340,6 +1340,36 @@ HashTableBucketPage* bucket_page = reinterpret_cast<HashTableBucketPage*>(page->
    - buffer_pool_manager 就像是内存/硬盘管理系统
    - 目录页面就像是文件系统的目录结构
    - 桶页面就像是实际存储文件内容的数据块
+   
 在这个构造函数中，代码初始化了一个最小的哈希表结构：一个目录页面和一个初始桶页面，建立了它们之间的引用关系，为后续的扩展操作做好了准备。重复来讲就是为哈希表分配一个目录页面和桶页面，并设置目录页面的page_id成员、将哈希表的首个目录项指向该桶。最后，不要忘记调用UnpinPage向缓冲池告知页面的使用完毕。
+
+
+```
+
+ 54 template <typename KeyType, typename ValueType, typename KeyComparator>
+ 55 uint32_t HASH_TABLE_TYPE::KeyToDirectoryIndex(KeyType key, HashTableDirectoryPage *dir_page) {
+ 56   uint32_t hashed_key = Hash(key);
+ 57   uint32_t mask = dir_page->GetGlobalDepthMask();
+ 58   return mask & hashed_key;
+ 59 }
+ 60 
+ 61 template <typename KeyType, typename ValueType, typename KeyComparator>
+ 62 page_id_t HASH_TABLE_TYPE::KeyToPageId(KeyType key, HashTableDirectoryPage *dir_page) {
+ 63   uint32_t idx = KeyToDirectoryIndex(key, dir_page);
+ 64   return dir_page->GetBucketPageId(idx);
+ 65 }
+ 66 
+ 67 template <typename KeyType, typename ValueType, typename KeyComparator>
+ 68 HashTableDirectoryPage *HASH_TABLE_TYPE::FetchDirectoryPage() {
+ 69   return reinterpret_cast<HashTableDirectoryPage *>(buffer_pool_manager_->FetchPage(directory_page_id_));
+ 70 }
+ 71 
+ 72 template <typename KeyType, typename ValueType, typename KeyComparator>
+ 73 HASH_TABLE_BUCKET_TYPE *HASH_TABLE_TYPE::FetchBucketPage(page_id_t bucket_page_id) {
+ 74   return reinterpret_cast<HASH_TABLE_BUCKET_TYPE *>(buffer_pool_manager_->FetchPage(bucket_page_id));
+ 75 }
+ 76
+
+```
 
 
