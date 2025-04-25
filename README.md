@@ -1486,12 +1486,26 @@ GetValue从哈希表中读取与键匹配的所有值结果，其通过哈希表
 ```
 100 template <typename KeyType, typename ValueType, typename KeyComparator>
 101 bool HASH_TABLE_TYPE::Insert(Transaction *transaction, const KeyType &key, const ValueType &value    ) {
+//功能：向哈希表插入键值对
+//参数：
+//transaction：事务对象（虽然未直接使用，但保留接口一致性）
+//key：要插入的键
+//value：要插入的值
+//返回值：bool类型，表示插入是否成功
+
 102   HashTableDirectoryPage *dir_page = FetchDirectoryPage();
 103   table_latch_.RLock();
+//获取目录页（固定页面）
+//获取表级读锁（共享锁），允许并发读取但阻止结构修改
+
 104   page_id_t bucket_page_id = KeyToPageId(key, dir_page);
 105   HASH_TABLE_BUCKET_TYPE *bucket = FetchBucketPage(bucket_page_id);
 106   Page *p = reinterpret_cast<Page *>(bucket);
 107   p->WLatch();
+//计算键对应的桶页面ID
+//获取桶页面并转换为Page类型以使用锁机制
+//获取桶页面的写锁（排他锁），阻止其他读写操作
+
 108   if (bucket->IsFull()) {
 109     p->WUnlatch();
 110     table_latch_.RUnlock();
@@ -1499,6 +1513,11 @@ GetValue从哈希表中读取与键匹配的所有值结果，其通过哈希表
 112     assert(buffer_pool_manager_->UnpinPage(bucket_page_id, true, nullptr));
 113     return SplitInsert(transaction, key, value);
 114   }
+//桶满处理：
+//释放桶写锁和表读锁
+//取消固定目录页和桶页（标记为脏页）
+//调用SplitInsert处理桶分裂和重新插入
+
 115   bool ret = bucket->Insert(key, value, comparator_);
 116   p->WUnlatch();
 117   table_latch_.RUnlock();
@@ -1506,6 +1525,12 @@ GetValue从哈希表中读取与键匹配的所有值结果，其通过哈希表
 119   assert(buffer_pool_manager_->UnpinPage(directory_page_id_, true, nullptr));
 120   assert(buffer_pool_manager_->UnpinPage(bucket_page_id, true, nullptr));
 121   return ret;
+//插入流程：
+//尝试向桶中插入键值对
+//释放桶写锁和表读锁
+//取消固定目录页和桶页（标记为脏页）
+//返回插入结果
+
 122 }
 ```
 
@@ -1516,7 +1541,14 @@ Insert函数的具体流程为：
 1. 获取目录页面和桶页面，在加全局读锁和桶写锁后检查桶是否已满，如已满则释放锁，并调用UnpinPage释放页面，然后调用SplitInsert实现桶分裂和插入；
 2. 如当前桶未满，则直接向该桶页面插入键值对，并释放锁和页面即可;
 
+**乐观锁 vs 悲观锁**
 
+这里我是一直使用悲观锁的：
 
+<img src="https://github.com/user-attachments/assets/267edd7a-62de-4492-a45d-2bf72ae2c1d5" 
+     alt="image" 
+     style="width:90%; max-width:600px;">
 
-
+<img src="https://github.com/user-attachments/assets/b0b8aea6-f2dd-4447-a66b-fb578a6585ce" 
+     alt="image" 
+     style="width:90%; max-width:600px;">
