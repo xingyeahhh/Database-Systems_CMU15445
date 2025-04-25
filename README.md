@@ -1552,3 +1552,76 @@ Insert函数的具体流程为：
 <img src="https://github.com/user-attachments/assets/b0b8aea6-f2dd-4447-a66b-fb578a6585ce" 
      alt="image" 
      style="width:90%; max-width:600px;">
+
+**SplitInsert功能**
+
+```
+124 template <typename KeyType, typename ValueType, typename KeyComparator>
+125 bool HASH_TABLE_TYPE::SplitInsert(Transaction *transaction, const KeyType &key, const ValueType &value) {
+126   HashTableDirectoryPage *dir_page = FetchDirectoryPage();
+127   table_latch_.WLock();
+      //Directory Page: Fetches the directory page that manages the hash structure
+      //Write Lock: Acquires exclusive table lock for structural modifications
+
+128   while (true) {
+      //while(true) 开始一个无限循环，直到成功插入或返回错误
+129     page_id_t bucket_page_id = KeyToPageId(key, dir_page);
+130     uint32_t bucket_idx = KeyToDirectoryIndex(key, dir_page);
+131     HASH_TABLE_BUCKET_TYPE *bucket = FetchBucketPage(bucket_page_id);
+
+       //KeyToPageId: 计算键应该存储在哪个桶页面，返回页面ID
+       //KeyToDirectoryIndex: 计算键对应的目录索引
+       //FetchBucketPage: 获取对应的桶页面
+
+       //桶满时的处理逻辑
+132     if (bucket->IsFull()) {
+133       uint32_t global_depth = dir_page->GetGlobalDepth();
+134       uint32_t local_depth = dir_page->GetLocalDepth(bucket_idx);
+135       page_id_t new_bucket_id = 0;
+136       HASH_TABLE_BUCKET_TYPE *new_bucket =
+137           reinterpret_cast<HASH_TABLE_BUCKET_TYPE *>(buffer_pool_manager_->NewPage(&new_bucket_id));
+138       assert(new_bucket != nullptr);
+        //检查桶是否已满
+        //获取目录的全局深度和当前桶的局部深度
+        //创建一个新的桶页面用于分裂
+
+
+//124-138行：首先，获取目录页面并加全局写锁，在添加全局写锁后，其他所有线程均被阻塞了，因此可以放心的操作数据成员。
+//不难注意到，在Insert中释放读锁和SplitInsert中释放写锁间存在空隙，其他线程可能在该空隙中被调度，从而改变桶页面或目录页面数据。
+//因此，在这里需要重新在目录页面中获取哈希键所对应的桶页面（可能与Insert中判断已满的页面不是同一页面），并检查对应的桶页面是否已满。如桶页面仍然是满的，则分配新桶和提取原桶页面的元数据。在由于桶分裂后仍所需插入的桶仍可能是满的，因此在这这里进行循环以解决该问题。
+
+
+139       if (global_depth == local_depth) {
+140         // if i == ij, extand the bucket dir, and split the bucket
+141         uint32_t bucket_num = 1 << global_depth;
+142         for (uint32_t i = 0; i < bucket_num; i++) {
+143           dir_page->SetBucketPageId(i + bucket_num, dir_page->GetBucketPageId(i));
+144           dir_page->SetLocalDepth(i + bucket_num, dir_page->GetLocalDepth(i));
+145         } 
+146         dir_page->IncrGlobalDepth();
+147         dir_page->SetBucketPageId(bucket_idx + bucket_num, new_bucket_id);
+148         dir_page->IncrLocalDepth(bucket_idx);
+149         dir_page->IncrLocalDepth(bucket_idx + bucket_num);
+150         global_depth++;
+151       } else {
+152         // if i > ij, split the bucket
+153         // more than one records point to the bucket
+154         // the records' low ij bits are same
+155         // and the high (i - ij) bits are index of the records point to the same bucket
+156         uint32_t mask = (1 << local_depth) - 1;
+157         uint32_t base_idx = mask & bucket_idx;
+158         uint32_t records_num = 1 << (global_depth - local_depth - 1);
+159         uint32_t step = (1 << local_depth);
+160         uint32_t idx = base_idx;
+161         for (uint32_t i = 0; i < records_num; i++) {
+162           dir_page->IncrLocalDepth(idx);
+163           idx += step * 2;
+164         } 
+165         idx = base_idx + step;
+166         for (uint32_t i = 0; i < records_num; i++) {
+167           dir_page->SetBucketPageId(idx, new_bucket_id);
+168           dir_page->IncrLocalDepth(idx); 
+169           idx += step * 2;
+170         }
+171       }
+```
