@@ -1679,20 +1679,41 @@ Insert函数的具体流程为：
 153         // more than one records point to the bucket
 154         // the records' low ij bits are same
 155         // and the high (i - ij) bits are index of the records point to the same bucket
+            // 含义：当全局深度 > 局部深度时，说明有多个目录项指向同一个物理桶，现在要拆分这些"共享桶"的指针
 156         uint32_t mask = (1 << local_depth) - 1;
+            //作用：生成一个低local_depth位全1的掩码
+
 157         uint32_t base_idx = mask & bucket_idx;
+            //操作：用掩码保留bucket_idx的低位
+            //物理意义：找到这个桶的"逻辑起始位置"
+            //bucket_idx=5 (0b101), local_depth=2
+            //base_idx=0b101 & 0b11 = 0b01 = 1
+
 158         uint32_t records_num = 1 << (global_depth - local_depth - 1);
+            //公式解释：需要处理的目录项数量 = 2^(全局深度-局部深度-1)
+            //为什么-1：因为要处理的是"镜像对"的数量
+            //global_depth=3, local_depth=1
+            //records_num=2^(3-1-1)=2
+
 159         uint32_t step = (1 << local_depth);
+            //物理意义：找到下一个"镜像组"的间隔
+            //示例：local_depth=1 → step=2
+
 160         uint32_t idx = base_idx;
 161         for (uint32_t i = 0; i < records_num; i++) {
 162           dir_page->IncrLocalDepth(idx);
 163           idx += step * 2;
-164         } 
+164         }
+            //初始目录：[A,B,A,B] (global_depth=2, local_depth=1)
+            //分裂bucket_idx=1 (base_idx=1): 更新索引1的local_depth (1→2)
+
 165         idx = base_idx + step;
 166         for (uint32_t i = 0; i < records_num; i++) {
 167           dir_page->SetBucketPageId(idx, new_bucket_id);
 168           dir_page->IncrLocalDepth(idx); 
 169           idx += step * 2;
+              //将部分指针重定向到新桶
+              //同样增加这些指针的局部深度
 170         }
 171       }
 
@@ -1703,6 +1724,23 @@ Insert函数的具体流程为：
              //将一半的目录项指向新创建的桶
              //这种情况下，目录大小不变，只是更新了部分目录项。
 
+
+             //完整示例演示
+             初始状态：
+             //global_depth=3, local_depth=1
+             //目录：[A,B,A,B,A,B,A,B]（8个条目）
+             //要分裂的桶：bucket_idx=3 (0b011)
+             执行过程：
+             //base_idx=0b011 & 0b1=1
+             //records_num=2^(3-1-1)=1
+             //step=2
+             更新原桶指针：
+             //idx=1 → 更新目录[1]的local_depth
+             设置新桶指针：
+             //idx=1+2=3 → 目录[3]指向新桶，local_depth+1
+             最终：
+             //目录[1]和[3]的local_depth=2
+             //目录[1]指向原桶，[3]指向新桶
 
 
 ```
