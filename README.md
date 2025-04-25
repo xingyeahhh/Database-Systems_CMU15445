@@ -1352,24 +1352,78 @@ HashTableBucketPage* bucket_page = reinterpret_cast<HashTableBucketPage*>(page->
  57   uint32_t mask = dir_page->GetGlobalDepthMask();
  58   return mask & hashed_key;
  59 }
+    //功能：将键转换为目录索引,确定键应该映射到目录的哪个位置
+    //调用Hash(key)计算键的哈希值 -> 从目录页获取全局深度掩码(GetGlobalDepthMask()) -> 使用掩码与哈希值进行按位与运算，得到目录索引
+    //目录页包含多个槽位(slot)，每个槽位指向一个桶页面 -> 多个目录槽位可能指向同一个桶页面（在桶未分裂时）, 这个索引是目录页的索引，不是桶的直接编号
  60 
  61 template <typename KeyType, typename ValueType, typename KeyComparator>
  62 page_id_t HASH_TABLE_TYPE::KeyToPageId(KeyType key, HashTableDirectoryPage *dir_page) {
  63   uint32_t idx = KeyToDirectoryIndex(key, dir_page);
  64   return dir_page->GetBucketPageId(idx);
  65 }
+    //功能：通过键找到对应的桶页面ID,将键最终映射到实际存储数据的桶页面（只是获取ID，不实际加载页面）
+    //先调用KeyToDirectoryIndex获取目录索引 -> 通过目录页的GetBucketPageId方法获取对应桶的页面ID
  66 
  67 template <typename KeyType, typename ValueType, typename KeyComparator>
  68 HashTableDirectoryPage *HASH_TABLE_TYPE::FetchDirectoryPage() {
  69   return reinterpret_cast<HashTableDirectoryPage *>(buffer_pool_manager_->FetchPage(directory_page_id_));
  70 }
+    //功能：获取目录页
+    //通过缓冲池管理器获取目录页(FetchPage) -> 将返回的通用页面指针转换为HashTableDirectoryPage*类型
+    //特点：会增加页面的引用计数(pin count), 使用后必须调用UnpinPage释放
  71 
  72 template <typename KeyType, typename ValueType, typename KeyComparator>
  73 HASH_TABLE_BUCKET_TYPE *HASH_TABLE_TYPE::FetchBucketPage(page_id_t bucket_page_id) {
  74   return reinterpret_cast<HASH_TABLE_BUCKET_TYPE *>(buffer_pool_manager_->FetchPage(bucket_page_id));
  75 }
  76
-
+    //功能：获取指定ID的桶页面（从缓冲池加载页面）
+    //参数：bucket_page_id - 要获取的桶页面ID
+    //过程：与FetchDirectoryPage类似，但针对任意桶页面
+    //注意：同样需要在使用后调用UnpinPage
 ```
+上面是一些用于提取目录页面、桶页面以及目录页面中的目录项的功能函数：
+
+ - **哈希映射流程：Key → Hash → Directory Index → Bucket Page ID → Bucket Page**
+ - 缓冲池管理：所有页面访问都通过缓冲池管理器，确保内存安全
+ - 类型安全：使用reinterpret_cast进行页面类型转换
+ - 全局深度：目录的全局深度决定了掩码大小，影响索引计算
+ - 页面生命周期：获取的页面必须在使用后正确释放(unpin)
+
+**典型使用流程**
+```
+// 示例使用流程
+auto dir_page = FetchDirectoryPage();
+uint32_t dir_idx = KeyToDirectoryIndex(key, dir_page); //是否增加pin count	- 否
+page_id_t bucket_id = KeyToPageId(key, dir_page);      //是否增加pin count	- 否
+auto bucket_page = FetchBucketPage(bucket_id);         //是否增加pin count	- 是
+
+// 对bucket_page进行操作...
+
+buffer_pool_manager_->UnpinPage(bucket_id, true);
+buffer_pool_manager_->UnpinPage(dir_page->GetPageId(), false);
+```
+ - 通过KeyToDirectoryIndex找到键对应的目录槽位
+ - 通过KeyToPageId获取桶页面ID
+ - 通过FetchBucketPage实际加载桶页面进行操作(桶页面指针)
+ - 操作完成后UnpinPage释放桶页面
+
+**遇上段流程比较**
+```
+先前流程： Key --→ bucket_idx(即 Directory Index) → page_id(即 Bucket Page ID) → Page → HashTableBucketPage → slot_idx
+                                             │                   
+                                             ↓                 
+本流程：   Key → Hash → Directory Index → Bucket Page ID → Bucket Page   ---→   (隐含的桶内查找过程)
+
+提醒：
+1. Page → HashTableBucketPage: 将通用页面对象转换为哈希表桶页面对象，代码: HashTableBucketPage* bucket = reinterpret_cast<HashTableBucketPage*>(page->GetData())
+
+2. 在桶内查找(slot_idx): 在桶页面内遍历槽位，寻找匹配的键， 代码: for (slot_idx = 0; slot_idx < BUCKET_SIZE; slot_idx++) {...}                                                     
+```
+
+
+
+
+
 
 
