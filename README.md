@@ -1592,7 +1592,7 @@ Insert函数的具体流程为：
 
           //情况1: 局部深度等于全局深度时的处理
 139       if (global_depth == local_depth) {
-140         // if i == j, extand the bucket dir, and split the bucket
+140         // if i == ij, extand the bucket dir, and split the bucket
 141         uint32_t bucket_num = 1 << global_depth;
 142         for (uint32_t i = 0; i < bucket_num; i++) {
 143           dir_page->SetBucketPageId(i + bucket_num, dir_page->GetBucketPageId(i));
@@ -1646,6 +1646,34 @@ Insert函数的具体流程为：
             //[A, B, C, D, A, 新桶, C, D]
             //其中1和5位置的local_depth=3，其余保持2
 
+            //局部深度的意义：数据正确分流，避免无限分裂，目录一致性
+            //当 global_depth == local_depth 时：
+            分裂前状态：
+            //目录有4个条目（global_depth=2）
+            //某个桶的local_depth=2（如bucket_idx=01）
+            //所有哈希值以01结尾的键都路由到这个桶
+            分裂后操作：
+            //现在需要3位哈希位来区分这两个桶（而之前只需要2位）
+
+            具体工作原理
+            //示例：插入键 K（假设 Hash(K)=101）
+            分裂前：
+            //取低2位 01 → 路由到bucket_idx=1的桶
+            分裂后：
+            //取低3位：
+            //如果是 101 → 路由到 新桶（目录索引 101=5）
+            //如果是 001 → 仍留在 原桶（目录索引 001=1）
+            目录结构变化：
+            [0] → 桶A (local_depth=2)
+            [1] → 桶B (local_depth=3) ← 原桶
+            [2] → 桶C (local_depth=2)
+            [3] → 桶D (local_depth=2)
+            [4] → 桶A (local_depth=2)
+            [5] → 桶B_new (local_depth=3) ← 新桶
+            [6] → 桶C (local_depth=2)
+            [7] → 桶D (local_depth=2)
+
+          //情况2: 局部深度小于全局深度时的处理
 151       } else {
 152         // if i > ij, split the bucket
 153         // more than one records point to the bucket
@@ -1667,4 +1695,14 @@ Insert函数的具体流程为：
 169           idx += step * 2;
 170         }
 171       }
+
+             //当局部深度小于全局深度时，不需要扩展目录：
+             //计算掩码和基础索引
+             //计算需要更新的记录数和步长
+             //更新指向原桶的所有目录项的局部深度
+             //将一半的目录项指向新创建的桶
+             //这种情况下，目录大小不变，只是更新了部分目录项。
+
+
+
 ```
