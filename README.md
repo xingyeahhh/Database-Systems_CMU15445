@@ -1590,19 +1590,62 @@ Insert函数的具体流程为：
 //不难注意到，在Insert中释放读锁和SplitInsert中释放写锁间存在空隙，其他线程可能在该空隙中被调度，从而改变桶页面或目录页面数据。
 //因此，在这里需要重新在目录页面中获取哈希键所对应的桶页面（可能与Insert中判断已满的页面不是同一页面），并检查对应的桶页面是否已满。如桶页面仍然是满的，则分配新桶和提取原桶页面的元数据。在由于桶分裂后仍所需插入的桶仍可能是满的，因此在这这里进行循环以解决该问题。
 
-
+          //情况1: 局部深度等于全局深度时的处理
 139       if (global_depth == local_depth) {
-140         // if i == ij, extand the bucket dir, and split the bucket
+140         // if i == j, extand the bucket dir, and split the bucket
 141         uint32_t bucket_num = 1 << global_depth;
 142         for (uint32_t i = 0; i < bucket_num; i++) {
 143           dir_page->SetBucketPageId(i + bucket_num, dir_page->GetBucketPageId(i));
 144           dir_page->SetLocalDepth(i + bucket_num, dir_page->GetLocalDepth(i));
-145         } 
+145         }
+           //操作图解：
+           //扩容前目录：[A, B, C, D] (global_depth=2, bucket_num=4)
+           //扩容后目录：[A, B, C, D, A, B, C, D] (global_depth=3)
+           //具体行为：
+           //将目录大小加倍（每个原有条目复制一份到新位置）
+           //i + bucket_num：新条目的位置（原位置+原目录大小）
+           //复制桶指针和局部深度值
+
 146         dir_page->IncrGlobalDepth();
+            //global_depth += 1，目录条目数量变为原来的2倍，global_depth从2→3，目录条目从4个变为8个
+
 147         dir_page->SetBucketPageId(bucket_idx + bucket_num, new_bucket_id);
+            //bucket_idx：原桶的目录索引，bucket_idx + bucket_num：对应的新位置（镜像位置）
+            //原bucket_idx=2 (二进制10)，bucket_num=4
+            //新位置=2+4=6 (二进制110)
+
 148         dir_page->IncrLocalDepth(bucket_idx);
 149         dir_page->IncrLocalDepth(bucket_idx + bucket_num);
+            //操作：将这两个位置的局部深度都+1
+            //为什么：原桶和新桶现在都需要更精细的区分，局部深度增加意味着需要多1位哈希位来区分
+
 150         global_depth++;
+            //保证后续代码使用正确的global_depth值
+
+            //当局部深度等于全局深度时，意味着目录必须扩容才能继续分裂桶：
+            //计算当前目录中的桶数量 bucket_num = 1 << global_depth
+            //复制现有目录项到新的扩展部分
+            //增加全局深度
+            //设置新桶的页面ID和增加相关桶的局部深度
+            //在这种情况下，目录大小会翻倍
+
+            //完整示例演示
+            假设初始状态：
+            //global_depth=2, local_depth=2
+            //目录：[A, B, C, D]（4个条目）
+            //要分裂的桶：bucket_idx=1 (01)
+            操作步骤：
+            //扩容目录→[A, B, C, D, A, B, C, D]
+            //global_depth→3
+            //设置新桶：bucket_idx=1→镜像位置1+4=5
+            //dir_page[5] = 新桶
+            更新局部深度：
+            //dir_page[1].local_depth=3
+            //dir_page[5].local_depth=3
+            最终目录：
+            //[A, B, C, D, A, 新桶, C, D]
+            //其中1和5位置的local_depth=3，其余保持2
+
 151       } else {
 152         // if i > ij, split the bucket
 153         // more than one records point to the bucket
