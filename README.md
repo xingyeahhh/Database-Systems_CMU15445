@@ -1271,7 +1271,46 @@ HashTableBucketPage* bucket_page = reinterpret_cast<HashTableBucketPage*>(page->
 
 ### Task 2,3 : HASH TABLE IMPLEMENTATION + CONCURRENCY CONTROL
 
+在这两个部分中，我们需要实现一个线程安全的可扩展哈希表。在对可扩展哈希表的原理清楚后，将其实现并不困难，难点在于如何在降低锁粒度、提高并发性的情况下保证线程安全。下面是哈希表的具体实现：
 
+```
+ 24 template <typename KeyType, typename ValueType, typename KeyComparator>
+ 25 HASH_TABLE_TYPE::ExtendibleHashTable(const std::string &name, BufferPoolManager *buffer_pool_manager, const KeyComparator &comparator, HashFunction<KeyType> hash_fn)
+ 27 : buffer_pool_manager_(buffer_pool_manager), comparator_(comparator), hash_fn_(std::move(hash_fn)) {
+      // name：哈希表的名称（字符串）
+      // buffer_pool_manager：缓冲池管理器的指针，用于管理页面
+      // comparator：键比较器，用于比较键的大小
+      // hash_fn：哈希函数，用于计算键的哈希值
+      // 将各个初始化，并传入function中
+      // 例如，hash_fn_使用std::move被初始化为传入的hash_fn，这表示所有权转移（移动语义）
+
+ 28   // LOG_DEBUG("BUCKET_ARRAY_SIZE = %ld", BUCKET_ARRAY_SIZE);
+      // 打印桶的大小，但是被注释掉了
+
+ 29   HashTableDirectoryPage *dir_page = reinterpret_cast<HashTableDirectoryPage *>(buffer_pool_manager_ -> NewPage(&directory_page_id_));
+      // 这两行代码创建了一个新的目录页面：
+      // buffer_pool_manager_->NewPage(&directory_page_id_)向缓冲池管理器请求一个新页面，并将页面ID存储在directory_page_id_中
+      // reinterpret_cast将返回的通用页面指针转换为HashTableDirectoryPage类型的指针，以便能够调用目录页面特有的方法
+ 31   dir_page->SetPageId(directory_page_id_);
+      // 这行代码将目录页面的ID设置为之前获取的ID，确保页面自身知道自己的ID。
+
+ 32   page_id_t new_bucket_id;
+ 33   buffer_pool_manager_->NewPage(&new_bucket_id);
+      // 这两行代码创建了一个新的桶页面，并将其ID存储在new_bucket_id中。
+
+ 34   dir_page->SetBucketPageId(0, new_bucket_id);
+      // 这行代码将目录的第一个槽位（索引0）指向新创建的桶页面，建立了目录和桶之间的关联。在初始状态下，哈希表只有一个桶。
+
+ 35   assert(buffer_pool_manager_->UnpinPage(directory_page_id_, true, nullptr));
+ 36   assert(buffer_pool_manager_->UnpinPage(new_bucket_id, true, nullptr));
+      // 这两行代码解除对目录页面和桶页面的固定：
+      // UnpinPage的第一个参数是页面ID
+      // 第二个参数true表示页面已被修改（脏页）需要写回磁盘
+      // 第三个参数nullptr是一个可选的锁跟踪器
+      // assert用于确保UnpinPage调用成功，如果失败会触发断言错误
+
+ 37 }
+```
 
 
 
