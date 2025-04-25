@@ -1427,6 +1427,94 @@ buffer_pool_manager_->UnpinPage(dir_page->GetPageId(), false);
 ```
 
 
+```
+ 80 template <typename KeyType, typename ValueType, typename KeyComparator>
+ 81 bool HASH_TABLE_TYPE::GetValue(Transaction *transaction, const KeyType &key, std::vector<ValueType> *result) {
+ 82   HashTableDirectoryPage *dir_page = FetchDirectoryPage();
+      //通过缓冲池获取哈希表目录页，这会增加目录页的pin count，确保页面不会被置换出缓冲池
+
+ 83   table_latch_.RLock();
+      //获取哈希表级别的读锁（共享锁）
+      //防止在查找过程中目录结构被修改（如桶分裂）
+
+ 84   page_id_t bucket_page_id = KeyToPageId(key, dir_page);
+ 85   HASH_TABLE_BUCKET_TYPE *bucket = FetchBucketPage(bucket_page_id);
+      //KeyToPageId：根据键计算对应的桶页面ID
+      //FetchBucketPage：从缓冲池获取实际的桶页面
+
+ 86   Page *p = reinterpret_cast<Page *>(bucket);
+ 87   p->RLatch();
+      //将桶页面转换为通用的Page类型以使用锁机制
+      //获取桶页面的读锁，允许并发读取但阻止写入
+
+ 88   bool ret = bucket->GetValue(key, comparator_, result);
+      //调用桶页面的GetValue方法实际执行查找
+      //使用比较器comparator_进行键的比较
+      //结果存储在result中，返回值表示是否找到
+
+ 89   p->RUnlatch();
+      //释放桶页面读锁
+ 90   table_latch_.RUnlock();
+      //释放表级读锁
+
+ 91   assert(buffer_pool_manager_->UnpinPage(directory_page_id_, false, nullptr));
+ 92   assert(buffer_pool_manager_->UnpinPage(bucket_page_id, false, nullptr));
+      //缓存管理：每个Fetch对应一个Unpin
+      //取消固定(unpin)桶页面（false表示页面未被修改，不是脏页）
+      //取消固定(unpin)目录页面
+      //使用assert确保Unpin操作成功
+ 93 
+ 94   return ret;
+ 95 }
+```
+ - 并发控制设计
+   - 锁层级：
+     - 表级读锁(table_latch_)：保护目录结构
+     - 页面级读锁(RLatch)：保护单个桶内容
+   - 锁获取顺序：
+     - 总是先获取表级锁，再获取页面级锁
+     - 避免死锁的关键设计
+   - 锁释放顺序：
+     - 与获取顺序相反（页面锁→表锁）
+   - 表级读锁保护目录结构
+   - 页面级读锁保护单个桶
+   - 这种设计最大化了并发性 
+       
+GetValue从哈希表中读取与键匹配的所有值结果，其通过哈希表的读锁保护目录页面，并使用桶的读锁保护桶页面。具体的操作步骤为先读取目录页面，再通过目录页面和哈希键或许对应的桶页面，最后调用桶页面的GetValue获取值结果。在函数返回时注意要UnpinPage所获取的页面。加锁时应当保证锁的获取、释放全局顺序以避免死锁。
+
+
+```
+100 template <typename KeyType, typename ValueType, typename KeyComparator>
+101 bool HASH_TABLE_TYPE::Insert(Transaction *transaction, const KeyType &key, const ValueType &value    ) {
+102   HashTableDirectoryPage *dir_page = FetchDirectoryPage();
+103   table_latch_.RLock();
+104   page_id_t bucket_page_id = KeyToPageId(key, dir_page);
+105   HASH_TABLE_BUCKET_TYPE *bucket = FetchBucketPage(bucket_page_id);
+106   Page *p = reinterpret_cast<Page *>(bucket);
+107   p->WLatch();
+108   if (bucket->IsFull()) {
+109     p->WUnlatch();
+110     table_latch_.RUnlock();
+111     assert(buffer_pool_manager_->UnpinPage(directory_page_id_, true, nullptr));
+112     assert(buffer_pool_manager_->UnpinPage(bucket_page_id, true, nullptr));
+113     return SplitInsert(transaction, key, value);
+114   }
+115   bool ret = bucket->Insert(key, value, comparator_);
+116   p->WUnlatch();
+117   table_latch_.RUnlock();
+118   // std::cout<<"find the unfull bucket"<<std::endl;
+119   assert(buffer_pool_manager_->UnpinPage(directory_page_id_, true, nullptr));
+120   assert(buffer_pool_manager_->UnpinPage(bucket_page_id, true, nullptr));
+121   return ret;
+122 }
+```
+
+Insert向哈希表插入键值对，这可能会导致桶的分裂和表的扩张，因此需要保证目录页面的读线程安全，一种比较简单的保证线程安全的方法为：在操作目录页面前对目录页面加读锁。但这种加锁方式使得Insert函数阻塞了整个哈希表，这严重影响了哈希表的并发性。可以注意到，表的扩张的发生频率并不高，对目录页面的操作属于读多写少的情况，因此可以使用乐观锁的方法优化并发性能，其在Insert被调用时仅保持读锁，只在需要桶分裂时重新获得读锁。
+
+Insert函数的具体流程为：
+
+1. 获取目录页面和桶页面，在加全局读锁和桶写锁后检查桶是否已满，如已满则释放锁，并调用UnpinPage释放页面，然后调用SplitInsert实现桶分裂和插入；
+2. 如当前桶未满，则直接向该桶页面插入键值对，并释放锁和页面即可;
 
 
 
