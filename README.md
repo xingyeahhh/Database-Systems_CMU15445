@@ -2107,7 +2107,8 @@ bool SeqScanExecutor::Next(Tuple *tuple, RID *rid) {
   return false;
 }
 ```
-- 1. 什么是谓词(Predicate)?
+
+- 什么是谓词(Predicate)?
   - 在数据库系统中，谓词是指返回布尔值(true/false)的条件表达式，用于过滤数据。例如：
     - SELECT * FROM students WHERE age > 20 AND grade = 'A';
     - 这里的 age > 20 AND grade = 'A' 就是一个谓词
@@ -2121,7 +2122,47 @@ if (predicate == nullptr || predicate->Evaluate(tuple, out_schema).GetAs<bool>()
   - 结果为 true: 元组满足条件，会被返回
   - 结果为 false: 元组被过滤掉，继续检查下一个
 
+**out_schema 与 table_schema 的详细对比**
+
+- table_schema (原始表模式)
+  - 来源：table_info_->schema_
+  - 内容：表的完整物理结构
+  - 示例：
+```
+// grades 表的 schema
+(student_id INT, 
+ course_id INT, 
+ score DOUBLE,
+ teacher VARCHAR(20))
+```
+- out_schema (输出模式)
+  - 来源：查询计划节点的 GetOutputSchema()
+  - 内容：查询结果的逻辑结构
+  - 示例：
+```
+-- 对应查询
+SELECT student_id, score+10 AS adjusted_score 
+FROM grades
+cpp
+// 输出模式：
+(student_id INT,adjusted_score DOUBLE)
+```
+
+```
+二者关系图解
+table_schema (物理存储)           out_schema (逻辑视图)
+┌─────────────┬─────────┐        ┌─────────────┬─────────────────┐
+│ student_id  │ INT     │        │ student_id  │ INT             │
+├─────────────┼─────────┤        ├─────────────┼─────────────────┤
+│ course_id   │ INT     │ ──────▶│ adjusted_   │ DOUBLE          │
+├─────────────┼─────────┤        │ score       │ (score+10)      │
+│ score       │ DOUBLE  │        └─────────────┴─────────────────┘
+├─────────────┼─────────┤
+│ teacher     │ VARCHAR │
+└─────────────┴─────────┘
+```
 **为什么数据库执行器要逐条获取结果（调用多次Next()），而不是一次性返回所有匹配的元组？**
+
 ```
     SeqScan
       |
@@ -2151,7 +2192,7 @@ if (predicate == nullptr || predicate->Evaluate(tuple, out_schema).GetAs<bool>()
 对于具有特定out_schema的计划节点，其构造输出元组的方式为遍历out_schema中的Column，并通过Column中ColumnValueExpression的Evaluate方法提取表元组对应的行：
 
 ```
-// 列值表达式求值
+// 列值表达式求值，上面的方程中会调用这个；
  36   auto Evaluate(const Tuple *tuple, const Schema *schema) const -> Value override {
  37     return tuple->GetValue(schema, col_idx_);
  38   }
@@ -2171,5 +2212,51 @@ if (predicate == nullptr || predicate->Evaluate(tuple, out_schema).GetAs<bool>()
 ```
 
 可以看出，Column中保存了该列在表模式中的列号，Evaluate根据该列号从表元组中提取对应的列。
+
+**全过程演示**
+```
+SELECT student_id, UPPER(name) AS cap_name 
+FROM students 
+WHERE age > 20;
+
+处理步骤
+1.定位原始数据：
+
+通过 table_schema 知道：
+student_id 在第0列（INT）
+name 在第1列（VARCHAR）
+age 在第2列（INT）
+
+2.谓词评估：
+// 检查 age > 20
+if (tuple.GetValue(&table_schema, 2).GetAs<int>() > 20) ...
+
+3.构建输出元组：
+values = {
+    tuple.GetValue(&table_schema, 0),  // student_id
+    UpperExpression(tuple.GetValue(&table_schema, 1)) // UPPER(name)
+};
+return Tuple(values, out_schema);
+
+4.输出验证：
+out_schema 确保最终结果只有两列：
+第0列：student_id (INT)
+第1列：cap_name (VARCHAR)
+
+
+
+SQL: SELECT student_id FROM students WHERE age > 20;
+
+
+执行流程：
+1. 扫描获取原始元组 (内存二进制数据)
+2. 评估谓词：
+   - 创建 ColumnValueExpression(age) → col_idx_=2
+   - 调用 Evaluate() → 使用 table_schema 定位age值
+3. 构建输出：
+   - 创建 ColumnValueExpression(student_id) → col_idx_=0
+   - 调用 Evaluate() → 使用 table_schema 提取ID值
+4. 用提取的值构建新元组（按out_schema格式）
+```
 
 ### InsertExecutor
