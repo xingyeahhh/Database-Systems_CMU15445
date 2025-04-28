@@ -2365,10 +2365,10 @@ void InsertExecutor::Init() {
 //避免不必要的资源消耗（如 INSERT INTO ... VALUES 时不会初始化查询执行器）
 //直接插入可以免掉（is_raw_ = true）
 
-对于复杂插入（如 INSERT ... SELECT ... WHERE）：
-InsertExecutor.Init()
-  → SeqScanExecutor.Init()
-      → FilterExecutor.Init()----->这块存疑
+//对于复杂插入（如 INSERT ... SELECT ... WHERE）：
+//InsertExecutor.Init()
+//  → SeqScanExecutor.Init()
+//      → FilterExecutor.Init()----->这块存疑
 ```
 **child_executor_ 更准确的说法是数据源执行器：**
 
@@ -2380,35 +2380,55 @@ InsertExecutor.Init()
 ```
 bool InsertExecutor::Next([[maybe_unused]] Tuple *tuple, RID *rid) {
   Transaction *txn = exec_ctx_->GetTransaction();
+  //作用：获取当前事务上下文
+  //用途：保证插入操作的原子性和隔离性
+  //关键点：所有表数据和索引的修改都在同一事务中
+
   Tuple tmp_tuple;
   RID tmp_rid;
+
+  //Raw Insert 处理路径（INSERT VALUES）
   if (is_raw_) {
     for (uint32_t idx = 0; idx < size_; idx++) {
-      const std::vector<Value> &raw_value = plan_->RawValuesAt(idx);
-      tmp_tuple = Tuple(raw_value, &table_info_->schema_);
-      if (table_info_->table_->InsertTuple(tmp_tuple, &tmp_rid, txn)) {
-        for (auto indexinfo : indexes_) {
+      const std::vector<Value> &raw_value = plan_->RawValuesAt(idx);       // 1. 获取原始值
+      tmp_tuple = Tuple(raw_value, &table_info_->schema_);                 // 2. 构造元组
+      if (table_info_->table_->InsertTuple(tmp_tuple, &tmp_rid, txn)) {    // 3. 插入表数据
+        for (auto indexinfo : indexes_) {                                  // 4. 更新所有索引
           indexinfo->index_->InsertEntry(
               tmp_tuple.KeyFromTuple(table_info_->schema_, indexinfo->key_schema_, indexinfo->index_->GetKeyAttrs()),
-              tmp_rid, txn);
+              tmp_rid, txn);   // 构造索引键
         }
       }
     }
     return false;
   }
-  while (child_executor_->Next(&tmp_tuple, &tmp_rid)) {
-    if (table_info_->table_->InsertTuple(tmp_tuple, &tmp_rid, txn)) {
-      for (auto indexinfo : indexes_) {
-        indexinfo->index_->InsertEntry(tmp_tuple.KeyFromTuple(*child_executor_->GetOutputSchema(),
-                                                              indexinfo->key_schema_, indexinfo->index_->GetKeyAttrs()),
-                                       tmp_rid, txn);
+
+    //值提取：从计划节点获取预定义的原始值列表
+    //元组构造：按照表结构(table_info_->schema_)将值打包成元组
+    //表插入：调用 TableHeap::InsertTuple 写入表数据
+    //索引维护：为每个索引构造键并插入索引项
+
+  //子查询 Insert 处理路径（INSERT SELECT）
+  while (child_executor_->Next(&tmp_tuple, &tmp_rid)) {                  //迭代获取元组
+    if (table_info_->table_->InsertTuple(tmp_tuple, &tmp_rid, txn)) {    // 1. 插入表数据
+      for (auto indexinfo : indexes_) {                                  // 2. 更新所有索引
+        indexinfo->index_->InsertEntry(
+        tmp_tuple.KeyFromTuple(*child_executor_->GetOutputSchema(), indexinfo->key_schema_, indexinfo->index_->GetKeyAttrs()),
+
+        // 注意使用子执行器的输出模式
+        //table_info_->schema_,  ---->  源模式
+        //indexinfo->key_schema_,  ---->  索引键模式
+        //indexinfo->index_->GetKeyAttrs()  ---->  键包含的属性
+
+        tmp_rid, txn);
       }
     }
   }
   return false;
 }
 ```
+***基本思路就是： 处理直接值插入 -> 处理子查询结果插入 -> 插入操作不输出元组***
 
-需要注意，Insert节点不应向外输出任何元组，所以其总是返回假，即所有的插入操作均应当在一次Next中被执行完成。当来源为自定义的元组数组时，根据表模式构造对应的元组，并插入表中；当来源为其他计划节点时，通过子节点获取所有元组并插入表。在插入过程中，应当使用InsertEntry更新表中的所有索引，InsertEntry的参数应由KeyFromTuple方法构造。
+需要注意，Insert节点不应向外输出任何元组，所以其总是返回false，即所有的插入操作均应当在一次Next中被执行完成。当来源为自定义的元组数组时，根据表模式构造对应的元组，并插入表中；当来源为其他计划节点时，通过子节点获取所有元组并插入表。在插入过程中，应当使用InsertEntry更新表中的所有索引，InsertEntry的参数应由KeyFromTuple方法构造。
 
 ### UpdateExecutor与DeleteExecutor
