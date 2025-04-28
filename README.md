@@ -2210,7 +2210,6 @@ table_schema (物理存储)           out_schema (逻辑视图)
 3. tuple->GetValue() 根据 schema 信息正确解析二进制数据
 
 ```
-
 可以看出，Column中保存了该列在表模式中的列号，Evaluate根据该列号从表元组中提取对应的列。
 
 **全过程演示**
@@ -2244,9 +2243,7 @@ out_schema 确保最终结果只有两列：
 第1列：cap_name (VARCHAR)
 
 
-
 SQL: SELECT student_id FROM students WHERE age > 20;
-
 
 执行流程：
 1. 扫描获取原始元组 (内存二进制数据)
