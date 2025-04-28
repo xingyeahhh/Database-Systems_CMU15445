@@ -1890,12 +1890,18 @@ Remove从哈希表中删除对应的键值对，其优化思想与Insert相同�
 ```
 229 template <typename KeyType, typename ValueType, typename KeyComparator>
 230 void HASH_TABLE_TYPE::Merge(Transaction *transaction, const KeyType &key, const ValueType &value) {
+
 231   HashTableDirectoryPage *dir_page = FetchDirectoryPage();
-232   table_latch_.WLock();
+232   table_latch_.WLock();              // 获取表级写锁
 233   uint32_t bucket_idx = KeyToDirectoryIndex(key, dir_page);
 234   page_id_t bucket_page_id = dir_page->GetBucketPageId(bucket_idx);
 235   HASH_TABLE_BUCKET_TYPE *bucket = FetchBucketPage(bucket_page_id);
+      //加写锁：合并需要独占访问目录结构
+      //定位目标桶：通过key找到对应的桶
+
 236   if (bucket->IsEmpty() && dir_page->GetLocalDepth(bucket_idx) != 0) {
+      //双条件：桶必须为空，不能是初始桶（local_depth>0）
+
 237     uint32_t local_depth = dir_page->GetLocalDepth(bucket_idx);
 238     uint32_t global_depth = dir_page->GetGlobalDepth();
 239     // How to find the bucket to Merge?
@@ -1903,9 +1909,16 @@ Remove从哈希表中删除对应的键值对，其优化思想与Insert相同�
 241     // have low (local_depth - 1) bits same
 242     // therefore, reverse the low local_depth can get the idx point to the bucket to Merge
 243     uint32_t merged_bucket_idx = bucket_idx ^ (1 << (local_depth - 1));
+        //位运算技巧：通过异或找到"镜像索引"
+        //例如：bucket_idx=01 (local_depth=2) → merged_bucket_idx=11
+        //获取兄弟桶：检查是否同样可合并
+
 244     page_id_t merged_page_id = dir_page->GetBucketPageId(merged_bucket_idx);
 245     HASH_TABLE_BUCKET_TYPE *merged_bucket = FetchBucketPage(merged_page_id);
+        //获取该桶
+
 246     if (dir_page->GetLocalDepth(merged_bucket_idx) == local_depth && merged_bucket->IsEmpty()) {
+          //兄弟桶要求：相同local_depth，同样为空
 247       local_depth--;
 248       uint32_t mask = (1 << local_depth) - 1;
 249       uint32_t idx = mask & bucket_idx;
@@ -1916,18 +1929,42 @@ Remove从哈希表中删除对应的键值对，其优化思想与Insert相同�
 254         dir_page->SetBucketPageId(idx, bucket_page_id);
 255         dir_page->DecrLocalDepth(idx);
 256         idx += step;
+            //深度减少：local_depth减1
+            //目录更新：将所有相关指针指向合并后的桶
 257       }
-258       buffer_pool_manager_->DeletePage(merged_page_id);
+258       buffer_pool_manager_->DeletePage(merged_page_id);  // 删除空桶
 259     }
 260     if (dir_page->CanShrink()) {
-261       dir_page->DecrGlobalDepth();
+261       dir_page->DecrGlobalDepth();                       // 可能收缩目录
 262     }
 263     assert(buffer_pool_manager_->UnpinPage(merged_page_id, true, nullptr));
 264   }
 265   table_latch_.WUnlock();
+      // 释放所有页面和锁
 266   assert(buffer_pool_manager_->UnpinPage(directory_page_id_, true, nullptr));
 267   assert(buffer_pool_manager_->UnpinPage(bucket_page_id, true, nullptr));
 268 }
+
+**合并过程示例**
+
+初始状态：
+目录索引  二进制  桶   local_depth
+[00]    00   → A     1
+[01]    01   → B     2 ← 要合并的空桶
+[10]    10   → A     1
+[11]    11   → C     2 ← 兄弟桶(空)
+
+合并后：
+[00]    00   → A     1
+[01]    01   → B     1 ← 深度减少
+[10]    10   → A     1
+[11]    11   → B     1 ← 指向B且深度减少
+删除桶C
 ```
 
+当桶变空且满足条件时，将其与"兄弟桶"合并，并可能收缩目录大小。
+
 在Merge函数获取写锁后，需要重新判断是否满足合并条件，以防止在释放锁的空隙时页面被更改，在合并被执行时，需要判断当前目录页面是否可以收缩，如可以搜索在这里仅需递减全局深度即可完成收缩，最后释放页面和写锁。
+
+
+
