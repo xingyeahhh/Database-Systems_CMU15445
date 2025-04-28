@@ -2500,28 +2500,61 @@ UpdateExecutor::UpdateExecutor(
   indexes_ = catalog->GetTableIndexes(table_info_->name_);
 }
 
+
 void UpdateExecutor::Init() { child_executor_->Init(); }
+//初始化子执行器（如 SeqScanExecutor），准备开始迭代数据源
+
 
 bool UpdateExecutor::Next([[maybe_unused]] Tuple *tuple, RID *rid) {
   Tuple src_tuple;
   auto *txn = this->GetExecutorContext()->GetTransaction();
+
+  // 遍历所有需要更新的元组
   while (child_executor_->Next(&src_tuple, rid)) {
+     // 1. 生成更新后的元组
     *tuple = this->GenerateUpdatedTuple(src_tuple);
+    // 2. 更新表数据
     if (table_info_->table_->UpdateTuple(*tuple, *rid, txn)) {
+    // 3. 更新所有相关索引
       for (auto indexinfo : indexes_) {
-        indexinfo->index_->DeleteEntry(tuple->KeyFromTuple(*child_executor_->GetOutputSchema(), indexinfo->key_schema_,
-                                                           indexinfo->index_->GetKeyAttrs()),
-                                       *rid, txn);
-        indexinfo->index_->InsertEntry(tuple->KeyFromTuple(*child_executor_->GetOutputSchema(), indexinfo->key_schema_,
-                                                           indexinfo->index_->GetKeyAttrs()),
-                                       *rid, txn);
+    // 先删除旧索引项
+        indexinfo->index_->DeleteEntry(
+        tuple->KeyFromTuple(*child_executor_->GetOutputSchema(), indexinfo->key_schema_, indexinfo->index_->GetKeyAttrs()),*rid, txn);
+
+    // 再插入新索引项
+        indexinfo->index_->InsertEntry(tuple->KeyFromTuple(*child_executor_->GetOutputSchema(), indexinfo->key_schema_,indexinfo->index_->GetKeyAttrs()), *rid, txn);
       }
     }
   }
-  return false;
+  return false;  // 更新操作不输出元组
 }
 ```
 UpdateExecutor::Next中，利用GenerateUpdatedTuple方法将源元组更新为新元组，在更新索引时，删除表中与源元组对应的所有索引记录，并增加与新元组对应的索引记录。
+
+**1. 元组更新生成 GenerateUpdatedTuple 内部逻辑：**
+```
+Tuple GenerateUpdatedTuple(const Tuple &src) {
+  std::vector<Value> values;
+  for (auto &update : plan_->GetUpdates()) {
+    // 计算每列的新值
+    values.push_back(update.second->Evaluate(&src, table_info_->schema_));
+  }
+  return Tuple(values, &table_info_->schema_);
+}
+```
+
+**示例**
+```
+UPDATE students 
+SET score = score + 10 
+WHERE department = 'CS';
+```
+- 执行过程
+  - child_executor_ 筛选出所有 department = 'CS' 的元组
+  - 对每个元组：
+    - 计算 score + 10
+    - 更新表数据
+    - 更新 score 字段上的所有索引
 
 ```
 
