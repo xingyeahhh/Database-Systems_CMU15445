@@ -1989,3 +1989,97 @@ Remove从哈希表中删除对应的键值对，其优化思想与Insert相同�
      alt="image" 
      style="width:90%; max-width:600px;">
 
+在关系型数据库中，物理查询计划在系统内部被组织成树的形式，并通过特定的查询处理模型（迭代器模型、生产者模型）进行执行。在本实验中所要实现的模型为迭代器模型，如上图所示，该模型的每个查询计划节点通过NEXT()方法得到其所需的下一个元组，直至NEXT()方法返回假。在执行流中，根节点的NEXT()方法最先被调用，其控制流向下传播直至叶节点。
+
+在bustub中，每个查询计划节点AbstractPlanNode都被包含在执行器类AbstractExecutor中，用户通过执行器类调用查询计划的Next()方法及初始化Init()方法，而查询计划节点中则保存该操作所需的特有信息，如顺序扫描需要在节点中保存其所要扫描的表标识符、连接需要在节点中保存其子节点及连接的谓词。同时。执行器类中也包含ExecutorContext上下文信息，其代表了查询计划的全局信息，如事务、事务管理器、锁管理器等。
+
+### SeqScanExecutor
+
+SeqScanExecutor执行顺序扫描操作，其通过Next()方法顺序遍历其对应表中的所有元组，并将元组返回至调用者。在bustub中，所有与表有关的信息被包含在TableInfo中：
+
+```
+ 40 struct TableInfo {
+ 41   /**
+ 42    * Construct a new TableInfo instance.
+ 43    * @param schema The table schema
+ 44    * @param name The table name
+ 45    * @param table An owning pointer to the table heap
+ 46    * @param oid The unique OID for the table
+ 47    */
+ 48   TableInfo(Schema schema, std::string name, std::unique_ptr<TableHeap> &&table, table_oid_t oid)
+ 49       : schema_{std::move(schema)}, name_{std::move(name)}, table_{std::move(table)}, oid_{oid} {    }  
+ 50   /** The table schema */
+ 51   Schema schema_;
+ 52   /** The table name */
+ 53   const std::string name_;
+ 54   /** An owning pointer to the table heap */
+ 55   std::unique_ptr<TableHeap> table_; //通过 unique_ptr 管理的 TableHeap 对象，提供表数据的访问
+ 56   /** The table OID */
+ 57   const table_oid_t oid_;            //用于从目录中查找正确的表信息
+ 58 };
+
+```
+
+表中的实际元组储存在TableHeap中，其包含用于插入、查找、更改、删除元组的所有函数接口，并可以通过TableIterator迭代器顺序遍历其中的元组。在SeqScanExecutor中，为其增加TableInfo、及迭代器私有成员，用于访问表信息和遍历表。在bustub中，所有表都被保存在目录Catalog中，可以通过表标识符从中提取对应的TableInfo：
+
+```
+SeqScanExecutor::SeqScanExecutor(ExecutorContext *exec_ctx, const SeqScanPlanNode *plan)
+    : AbstractExecutor(exec_ctx),    //执行器上下文，提供执行过程中需要的各种资源
+      plan_(plan),                   //顺序扫描计划节点，包含执行计划信息
+      iter_(nullptr, RID(INVALID_PAGE_ID, 0), nullptr),
+      end_(nullptr, RID(INVALID_PAGE_ID, 0), nullptr) {
+      //初始化 iter_ 和 end_为默认构造的迭代器(空指针和无效RID)
+      //是一个 构造函数（Constructor），与类名完全相同，无返回类型，冒号 : 后的部分（用于初始化成员变量和基类）
+  table_oid_t oid = plan->GetTableOid();
+  //从计划节点获取要扫描的表的OID(对象标识符)
+
+  table_info_ = exec_ctx->GetCatalog()->GetTable(oid);
+  //通过执行上下文获取目录(catalog)，然后从目录中获取表的信息(TableInfo结构)
+
+  iter_ = table_info_->table_->Begin(exec_ctx->GetTransaction());
+  //获取表的起始迭代器，用于开始扫描表数据
+  //table_info_->table_ 是 TableHeap 类型的表数据
+  //Begin() 返回指向表中第一条记录的迭代器
+
+  end_ = table_info_->table_->End();
+  //获取表的结束迭代器，用于判断扫描何时完成
+}
+```
+
+在Init()中，执行计划节点所需的初始化操作，在这里重新设定表的迭代器，使得查询计划可以重新遍历表：
+- 构造函数只在执行器创建时调用一次
+- Init() 方法会在每次执行开始前调用（包括第一次执行和可能的重复执行）
+- Init()：负责可重复的初始化（如重置迭代器）
+
+```
+void SeqScanExecutor::Init() {
+  iter_ = table_info_->table_->Begin(exec_ctx_->GetTransaction());
+  end_ = table_info_->table_->End();
+}
+```
+
+在Next()中，计划节点遍历表，并通过输入参数返回元组，当遍历结束时返回假：
+
+```
+bool SeqScanExecutor::Next(Tuple *tuple, RID *rid) {
+  const Schema *out_schema = this->GetOutputSchema();
+  Schema table_schema = table_info_->schema_;
+  while (iter_ != end_) {
+    Tuple table_tuple = *iter_;
+    *rid = table_tuple.GetRid();
+    std::vector<Value> values;
+    for (const auto &col : GetOutputSchema()->GetColumns()) {
+      values.emplace_back(col.GetExpr()->Evaluate(&table_tuple, &table_schema));
+    }
+    *tuple = Tuple(values, out_schema);
+    auto *predicate = plan_->GetPredicate();
+    if (predicate == nullptr || predicate->Evaluate(tuple, out_schema).GetAs<bool>()) {
+      ++iter_;
+      return true;
+    }
+    ++iter_;
+  }
+  return false;
+}
+```
+
