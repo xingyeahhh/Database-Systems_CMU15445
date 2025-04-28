@@ -1980,4 +1980,12 @@ Remove从哈希表中删除对应的键值对，其优化思想与Insert相同�
 在Merge函数获取写锁后，需要重新判断是否满足合并条件，以防止在释放锁的空隙时页面被更改，在合并被执行时，需要判断当前目录页面是否可以收缩，如可以搜索在这里仅需递减全局深度即可完成收缩，最后释放页面和写锁。
 
 
+## Project 3 : QUERY EXECUTION
+
+在关系数据库中，SQL语句将被转换为逻辑查询计划，并在进行查询优化后转化为物理查询计划，系统通过执行物理查询计划完成对应的语句功能。在本实验中，需要为bustub实现物理查询计划执行功能，包括顺序扫描、插入、删除、更改、连接、聚合以及DISTINCT和LIMIT。
+
+### 查询计划执行
+<img src="https://github.com/user-attachments/assets/d1998a22-7dc0-4b0d-b0a1-440b887db3b8" 
+     alt="image" 
+     style="width:90%; max-width:600px;">
 
