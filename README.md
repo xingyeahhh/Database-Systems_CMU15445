@@ -2062,24 +2062,114 @@ void SeqScanExecutor::Init() {
 
 ```
 bool SeqScanExecutor::Next(Tuple *tuple, RID *rid) {
+  //返回值：bool 表示是否获取到了下一个有效元组
+  //参数：
+  //tuple：输出参数，用于返回找到的元组
+  //rid：输出参数，用于返回元组的记录ID
+
   const Schema *out_schema = this->GetOutputSchema();
   Schema table_schema = table_info_->schema_;
-  while (iter_ != end_) {
+  //获取输出模式(out_schema)和表模式(table_schema)
+
+  while (iter_ != end_) {  //遍历表中的所有元组，直到结束迭代器(end_)
     Tuple table_tuple = *iter_;
     *rid = table_tuple.GetRid();
+     //解引用迭代器获取当前元组
+     //保存当前元组的RID(记录ID)
+
     std::vector<Value> values;
     for (const auto &col : GetOutputSchema()->GetColumns()) {
       values.emplace_back(col.GetExpr()->Evaluate(&table_tuple, &table_schema));
     }
     *tuple = Tuple(values, out_schema);
+    //为输出模式中的每一列计算表达式值
+    //用计算出的值构造新的输出元组
+    //谓词过滤(WHERE条件)
+    //假设查询是：
+                SELECT score + 10 AS adjusted_score FROM students;
+    //对于 adjusted_score 列：
+    //col.GetExpr() 返回 score + 10 这个表达式
+    //Evaluate() 会计算当前元组的 score 值并加10
+    //结果值被存入 values 向量
+
     auto *predicate = plan_->GetPredicate();
     if (predicate == nullptr || predicate->Evaluate(tuple, out_schema).GetAs<bool>()) {
       ++iter_;
       return true;
+      //如果没有谓词(predicate == nullptr)或谓词评估为真，则：
+      //移动迭代器到下一个位置
+      //返回true表示找到有效元组
+      //在返回当前结果前，先将迭代器移动到下一个位置
+      //这样下次调用Next()时，迭代器已经指向正确位置
     }
     ++iter_;
   }
   return false;
 }
 ```
+- 1. 什么是谓词(Predicate)?
+  - 在数据库系统中，谓词是指返回布尔值(true/false)的条件表达式，用于过滤数据。例如：
+    - SELECT * FROM students WHERE age > 20 AND grade = 'A';
+    - 这里的 age > 20 AND grade = 'A' 就是一个谓词
 
+auto *predicate = plan_->GetPredicate();
+  
+if (predicate == nullptr || predicate->Evaluate(tuple, out_schema).GetAs<bool>())
+- predicate 就是从查询计划中获取的过滤条件。
+- 如果谓词为 nullptr (没有过滤条件)，自动视为"真"
+- 否则调用 Evaluate() 计算表达式结果，然后 GetAs<bool>() 转换为布尔值
+  - 结果为 true: 元组满足条件，会被返回
+  - 结果为 false: 元组被过滤掉，继续检查下一个
+
+**为什么数据库执行器要逐条获取结果（调用多次Next()），而不是一次性返回所有匹配的元组？**
+```
+    SeqScan
+      |
+      v
+   Filter(谓词)
+      |
+      v
+   Project(列投影)
+      |
+      v
+   Sort/GroupBy...
+```
+- 流式处理（Pipeline Processing）的优势
+  - 数据库采用这种"懒加载"方式的主要原因包括：
+  - 内存效率
+    - 降低内存压力：对于百万级的大表，一次性加载所有结果会耗尽内存
+    - 支持分页：客户端可以随时停止获取更多结果（如只取前100条）
+  - 执行效率
+    - 早期过滤：可以在获取第一条结果后就返回，不用等待全部处理完成
+    - 并行处理：上层操作（如连接、排序）可以与其他操作流水线并行执行
+  - 系统响应性
+    - 快速首响应时间：用户能更快看到第一批结果
+    - 可中断性：查询可以中途取消而不用完成全部工作
+
+在这里，通过迭代器iter_访问元组，当计划节点谓词predicate非空时，通过predicate的Evaluate方法评估当前元组是否满足谓词，如满足则返回，否则遍历下一个元组。值得注意的是，表中的元组应当以out_schema的模式被重组。在bustub中，所有查询计划节点的输出元组均通过out_schema中各列Column的ColumnValueExpression中的各种“Evaluate”方法构造，如Evaluate、EvaluateJoin、EvaluateAggregate。
+
+对于具有特定out_schema的计划节点，其构造输出元组的方式为遍历out_schema中的Column，并通过Column中ColumnValueExpression的Evaluate方法提取表元组对应的行：
+
+```
+// 列值表达式求值
+ 36   auto Evaluate(const Tuple *tuple, const Schema *schema) const -> Value override {
+ 37     return tuple->GetValue(schema, col_idx_);
+ 38   }
+
+关键设计：
+1. 列索引绑定：col_idx_ 保存了该列在原始表中的位置，col_idx_：就像书的目录，告诉你"学生ID"信息存储在元组的哪个位置
+2. 统一接口：所有表达式类型（列引用、运算、聚合等）都实现 Evaluate 方法
+3. 模式感知：通过 schema 参数正确解析元组数据布局（schema 参数：相当于数据解码手册，说明：每个列的类型（INT/VARCHAR等），列的排列顺序，变长数据的存储位置）
+
+// 当处理 SELECT student_id FROM students 时：
+1. SeqScanExecutor::Next() 调用 col.GetExpr()->Evaluate()
+2. ColumnValueExpression::Evaluate() 执行:
+   - 查找 tuple 中第 col_idx_ 个位置的值
+   - 假设 col_idx_ = 0 (student_id 是表的第一列)
+3. tuple->GetValue() 根据 schema 信息正确解析二进制数据
+
+```
+
+可以看出，Column中保存了该列在表模式中的列号，Evaluate根据该列号从表元组中提取对应的列。
+
+### InsertExecutor
