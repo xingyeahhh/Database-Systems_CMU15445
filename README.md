@@ -1781,3 +1781,153 @@ Insert函数的具体流程为：
              //[7] → 桶B_new (depth=2) ← 处理哈希位结尾11
 
 ```
+
+139-171行：在这里，需要根据全局深度和桶页面的局部深度判断扩展表和分裂桶的策略。当global_depth == local_depth时，需要进行表扩展和桶分裂，global_depth == local_depth仅需进行桶分裂即可。原理介绍见上文所示：表扩展及分裂桶、仅分裂桶，在这里不再赘述。
+
+```
+173       // rehash all records in bucket j
+174       for (uint32_t i = 0; i < BUCKET_ARRAY_SIZE; i++) {
+            //BUCKET_ARRAY_SIZE：每个桶的固定容量（如128个槽位）
+            //作用：检查桶中的每一个可能存在的键值对
+
+175         KeyType j_key = bucket->KeyAt(i);       // 获取第i个位置的键
+176         ValueType j_value = bucket->ValueAt(i); // 获取对应的值
+177         bucket->RemoveAt(i);                    // 从原桶移除该键值对
+            //注意：这里先移除再重新插入，是为了避免重复数据
+            //RemoveAt只修改桶的槽位数组，不影响目录页的路由信息
+            //仅清除槽位标记（如设置为空位），该槽位变为可复用状态
+
+178         if (KeyToPageId(j_key, dir_page) == bucket_page_id) {
+179           bucket->Insert(j_key, j_value, comparator_);
+180         } else {
+181           new_bucket->Insert(j_key, j_value, comparator_);
+182         }
+          //KeyToPageId：根据最新的目录状态计算键应属的桶
+          //会使用更新后的local_depth进行路由判断
+          //分流逻辑：
+          //如果键仍属于原桶 → 重新插回原桶; 否则 → 插入新桶
+
+183       }
+184       // std::cout<<"original bucket size = "<<bucket->NumReadable()<<std::endl;
+185       // std::cout<<"new bucket size = "<<new_bucket->NumReadable()<<std::endl;
+186       assert(buffer_pool_manager_->UnpinPage(bucket_page_id, true, nullptr));
+187       assert(buffer_pool_manager_->UnpinPage(new_bucket_id, true, nullptr));
+          //UnpinPage：释放对物理页面的占用
+          //参数true：标记页面已被修改（脏页需要写回磁盘）
+          //assert：确保释放操作成功（生产环境应处理错误）
+
+          //这种"先移除再判断"的设计实现了：
+          //无临时内存分配的rehash
+          //写时复制(Copy-on-Write)的变体
+          //最小化数据移动的优化策略
+```
+
+173-187行：在完成桶分裂后，应当将原桶页面中的记录重新插入哈希表，由于记录的低i-1位仅与原桶页面和新桶页面对应，因此记录插入的桶页面仅可能为原桶页面和新桶页面两个选择。在重新插入完记录后，释放新桶页面和原桶页面。
+
+```
+188     } else {
+189       bool ret = bucket->Insert(key, value, comparator_);
+          //尝试将键值对插入桶中，ret：返回插入是否成功（可能因重复键失败）
+
+190       table_latch_.WUnlock();
+          //释放之前获取的表级写锁（在SplitInsert入口处获取）
+          //此时其他线程可以访问哈希表
+
+191       // std::cout<<"find the unfull bucket"<<std::endl;
+192       assert(buffer_pool_manager_->UnpinPage(directory_page_id_, true, nullptr));
+193       assert(buffer_pool_manager_->UnpinPage(bucket_page_id, true, nullptr));
+194       return ret;
+          //释放目录页和桶页的占用
+          //true：标记页面为脏页（因插入操作修改了内容）
+          //assert：确保释放操作成功（生产环境需错误处理）
+          //返回插入操作的布尔结果：true：插入成功； false：插入失败（如键已存在）
+195     }
+196   }
+          //当目标桶未满时，直接插入键值对并完成资源释放。
+197 
+198   return false;
+199 }
+```
+
+桶最初检测为满，进入SplitInsert -> 在分裂并rehash后再次检查，发现桶现在未满 -> 此时直接插入新键值对，避免不必要的再次分裂
+
+188-198行：若当前键值对所插入的桶页面非空（被其他线程修改或桶分裂后结果），则直接插入键值对，并释放锁和页面，并将插入结果返回Insert。
+
+
+```
+204 template <typename KeyType, typename ValueType, typename KeyComparator>
+205 bool HASH_TABLE_TYPE::Remove(Transaction *transaction, const KeyType &key, const ValueType &value) {
+
+206   HashTableDirectoryPage *dir_page = FetchDirectoryPage();          // 获取目录页
+207   table_latch_.RLock();                                             // 加表级读锁
+208   page_id_t bucket_page_id = KeyToPageId(key, dir_page);            // 计算桶页面ID
+209   uint32_t bucket_idx = KeyToDirectoryIndex(key, dir_page);         // 计算目录索引
+210   HASH_TABLE_BUCKET_TYPE *bucket = FetchBucketPage(bucket_page_id); // 获取桶
+      //并发控制：使用表级读锁保护目录结构
+      //双重定位：先找到目录项，再获取物理桶
+
+211   Page *p = reinterpret_cast<Page *>(bucket);
+212   p->WLatch();                                                   // 加桶级写锁
+213   bool ret = bucket->Remove(key, value, comparator_);            // 执行删除
+214   p->WUnlatch();                                                 // 释放桶锁
+
+215   if (bucket->IsEmpty() && dir_page->GetLocalDepth(bucket_idx) != 0) {
+216     table_latch_.RUnlock();                  // 先释放读锁
+217     this->Merge(transaction, key, value);    // 触发合并
+218   } else {
+219     table_latch_.RUnlock();                  // 常规释放锁
+220   }
+221   assert(buffer_pool_manager_->UnpinPage(bucket_page_id, true, nullptr));
+222   assert(buffer_pool_manager_->UnpinPage(directory_page_id_, true, nullptr));
+      //页面释放：标记桶页和目录页为脏页（true）
+      //结果返回：告知调用方是否删除成功
+223   return ret;
+224 }
+```
+
+Remove从哈希表中删除对应的键值对，其优化思想与Insert相同，由于桶的合并并不频繁，因此在删除键值对时仅获取全局读锁，只在需要合并桶时获取全局写锁。当删除后桶为空且目录项的局部深度不为零时，释放读锁并调用Merge尝试合并页面，随后释放锁和页面并返回。
+
+```
+229 template <typename KeyType, typename ValueType, typename KeyComparator>
+230 void HASH_TABLE_TYPE::Merge(Transaction *transaction, const KeyType &key, const ValueType &value) {
+231   HashTableDirectoryPage *dir_page = FetchDirectoryPage();
+232   table_latch_.WLock();
+233   uint32_t bucket_idx = KeyToDirectoryIndex(key, dir_page);
+234   page_id_t bucket_page_id = dir_page->GetBucketPageId(bucket_idx);
+235   HASH_TABLE_BUCKET_TYPE *bucket = FetchBucketPage(bucket_page_id);
+236   if (bucket->IsEmpty() && dir_page->GetLocalDepth(bucket_idx) != 0) {
+237     uint32_t local_depth = dir_page->GetLocalDepth(bucket_idx);
+238     uint32_t global_depth = dir_page->GetGlobalDepth();
+239     // How to find the bucket to Merge?
+240     // Answer: After Merge, the records, which pointed to the Merged Bucket,
+241     // have low (local_depth - 1) bits same
+242     // therefore, reverse the low local_depth can get the idx point to the bucket to Merge
+243     uint32_t merged_bucket_idx = bucket_idx ^ (1 << (local_depth - 1));
+244     page_id_t merged_page_id = dir_page->GetBucketPageId(merged_bucket_idx);
+245     HASH_TABLE_BUCKET_TYPE *merged_bucket = FetchBucketPage(merged_page_id);
+246     if (dir_page->GetLocalDepth(merged_bucket_idx) == local_depth && merged_bucket->IsEmpty()) {
+247       local_depth--;
+248       uint32_t mask = (1 << local_depth) - 1;
+249       uint32_t idx = mask & bucket_idx;
+250       uint32_t records_num = 1 << (global_depth - local_depth);
+251       uint32_t step = (1 << local_depth);
+252 
+253       for (uint32_t i = 0; i < records_num; i++) {
+254         dir_page->SetBucketPageId(idx, bucket_page_id);
+255         dir_page->DecrLocalDepth(idx);
+256         idx += step;
+257       }
+258       buffer_pool_manager_->DeletePage(merged_page_id);
+259     }
+260     if (dir_page->CanShrink()) {
+261       dir_page->DecrGlobalDepth();
+262     }
+263     assert(buffer_pool_manager_->UnpinPage(merged_page_id, true, nullptr));
+264   }
+265   table_latch_.WUnlock();
+266   assert(buffer_pool_manager_->UnpinPage(directory_page_id_, true, nullptr));
+267   assert(buffer_pool_manager_->UnpinPage(bucket_page_id, true, nullptr));
+268 }
+```
+
+在Merge函数获取写锁后，需要重新判断是否满足合并条件，以防止在释放锁的空隙时页面被更改，在合并被执行时，需要判断当前目录页面是否可以收缩，如可以搜索在这里仅需递减全局深度即可完成收缩，最后释放页面和写锁。
