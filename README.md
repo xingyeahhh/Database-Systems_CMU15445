@@ -2431,4 +2431,100 @@ bool InsertExecutor::Next([[maybe_unused]] Tuple *tuple, RID *rid) {
 
 需要注意，Insert节点不应向外输出任何元组，所以其总是返回false，即所有的插入操作均应当在一次Next中被执行完成。当来源为自定义的元组数组时，根据表模式构造对应的元组，并插入表中；当来源为其他计划节点时，通过子节点获取所有元组并插入表。在插入过程中，应当使用InsertEntry更新表中的所有索引，InsertEntry的参数应由KeyFromTuple方法构造。
 
+**什么是InsertEntry？ 深度解析**
+
+InsertEntry 是 Bustub 索引机制中的核心操作，负责将键值对插入到索引结构中。
+  1. 本质功能
+   - InsertEntry 是索引结构的成员方法，用于：
+      ```
+     // 基本调用形式
+     index->InsertEntry(index_key, tuple_rid, transaction);
+     ```
+   - 输入：
+     - index_key：索引键（通过 KeyFromTuple 生成）
+     - tuple_rid：元组的位置标识（RID）
+     - transaction：当前事务上下文
+   - 作用：建立索引键到元组物理位置的映射  
+     
+  2. 键构造过程
+  - KeyFromTuple 的工作细节：
+```
+Tuple key = tuple.KeyFromTuple(
+    table_schema,    // 表结构
+    index_schema,    // 索引定义的结构
+    key_attrs        // 索引包含的列索引
+);
+```
+  - 示例：
+    - 表结构：(id INT, name VARCHAR, age INT)
+    - 索引定义：CREATE INDEX idx_age ON students(age)
+    - 生成的索引键：只包含age列的值 
+
+
 ### UpdateExecutor与DeleteExecutor
+
+UpdateExecutor与DeleteExecutor用于从特定的表中更新、删除元组，其实现方法与InsertExecutor相似，但其元组来源仅为其他计划节点：
+
+```
+
+UpdateExecutor::UpdateExecutor(ExecutorContext *exec_ctx, const UpdatePlanNode *plan,
+                               std::unique_ptr<AbstractExecutor> &&child_executor)
+    : AbstractExecutor(exec_ctx), plan_(plan), child_executor_(child_executor.release()) {
+  table_oid_t oid = plan->TableOid();
+  auto catalog = exec_ctx->GetCatalog();
+  table_info_ = catalog->GetTable(oid);
+  indexes_ = catalog->GetTableIndexes(table_info_->name_);
+}
+
+void UpdateExecutor::Init() { child_executor_->Init(); }
+
+bool UpdateExecutor::Next([[maybe_unused]] Tuple *tuple, RID *rid) {
+  Tuple src_tuple;
+  auto *txn = this->GetExecutorContext()->GetTransaction();
+  while (child_executor_->Next(&src_tuple, rid)) {
+    *tuple = this->GenerateUpdatedTuple(src_tuple);
+    if (table_info_->table_->UpdateTuple(*tuple, *rid, txn)) {
+      for (auto indexinfo : indexes_) {
+        indexinfo->index_->DeleteEntry(tuple->KeyFromTuple(*child_executor_->GetOutputSchema(), indexinfo->key_schema_,
+                                                           indexinfo->index_->GetKeyAttrs()),
+                                       *rid, txn);
+        indexinfo->index_->InsertEntry(tuple->KeyFromTuple(*child_executor_->GetOutputSchema(), indexinfo->key_schema_,
+                                                           indexinfo->index_->GetKeyAttrs()),
+                                       *rid, txn);
+      }
+    }
+  }
+  return false;
+}
+```
+UpdateExecutor::Next中，利用GenerateUpdatedTuple方法将源元组更新为新元组，在更新索引时，删除表中与源元组对应的所有索引记录，并增加与新元组对应的索引记录。
+
+```
+
+DeleteExecutor::DeleteExecutor(ExecutorContext *exec_ctx, const DeletePlanNode *plan,
+                               std::unique_ptr<AbstractExecutor> &&child_executor)
+    : AbstractExecutor(exec_ctx), plan_(plan), child_executor_(child_executor.release()) {
+  table_oid_t oid = plan->TableOid();
+  auto catalog = exec_ctx->GetCatalog();
+  table_info_ = catalog->GetTable(oid);
+  indexes_ = catalog->GetTableIndexes(table_info_->name_);
+}
+
+void DeleteExecutor::Init() { child_executor_->Init(); }
+
+bool DeleteExecutor::Next([[maybe_unused]] Tuple *tuple, RID *rid) {
+  auto *txn = this->GetExecutorContext()->GetTransaction();
+  while (child_executor_->Next(tuple, rid)) {
+    if (table_info_->table_->MarkDelete(*rid, txn)) {
+      for (auto indexinfo : indexes_) {
+        indexinfo->index_->DeleteEntry(tuple->KeyFromTuple(*child_executor_->GetOutputSchema(), indexinfo->key_schema_,
+                                                           indexinfo->index_->GetKeyAttrs()),
+                                       *rid, txn);
+      }
+    }
+  }
+  return false;
+}
+```
+
+### NestedLoopJoinExecutor
