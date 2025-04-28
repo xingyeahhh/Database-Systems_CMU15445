@@ -1991,6 +1991,40 @@ Remove从哈希表中删除对应的键值对，其优化思想与Insert相同�
 
 在关系型数据库中，物理查询计划在系统内部被组织成树的形式，并通过特定的查询处理模型（迭代器模型、生产者模型）进行执行。在本实验中所要实现的模型为迭代器模型，如上图所示，该模型的每个查询计划节点通过NEXT()方法得到其所需的下一个元组，直至NEXT()方法返回假。在执行流中，根节点的NEXT()方法最先被调用，其控制流向下传播直至叶节点。
 
+谓词在计划中的存储方式
+```
+1.在 Bustub 中，谓词以表达式树的形式存储在计划节点中：
+
+// 示例：WHERE age > 20 AND name = 'Alice' 的存储结构
+       AND
+      /   \
+     >     =
+    / \   / \
+ age 20 name 'Alice'
+
+2.Bustub 中常见的计划节点类型：
+//plan具体的类型
+计划类型	对应SQL	功能
+SeqScanPlanNode	SELECT * FROM table	顺序扫描
+IndexScanPlanNode	SELECT * FROM table WHERE id=1	索引扫描
+InsertPlanNode	INSERT INTO ...	数据插入
+AggregationPlanNode	SELECT COUNT(*) ...	聚合计算
+NestedLoopJoinPlanNode	SELECT * FROM a,b WHERE a.id=b.id	嵌套循环连接
+
+plan内存结构示意图
+plan_ (SeqScanPlanNode对象)
+│
+├── table_oid_ : 0x1234
+├── output_schema_ : Schema对象
+└── predicate_ : AbstractExpression* (指向表达式树根节点)
+       │
+       ↓
+       AND (LogicExpression)
+      /   \
+     >     =  (ComparisonExpression)
+    / \   / \
+ age  20 name 'Alice' (ColumnValue/ConstantValueExpression)
+```
 在bustub中，每个查询计划节点AbstractPlanNode都被包含在执行器类AbstractExecutor中，用户通过执行器类调用查询计划的Next()方法及初始化Init()方法，而查询计划节点中则保存该操作所需的特有信息，如顺序扫描需要在节点中保存其所要扫描的表标识符、连接需要在节点中保存其子节点及连接的谓词。同时。执行器类中也包含ExecutorContext上下文信息，其代表了查询计划的全局信息，如事务、事务管理器、锁管理器等。
 
 ### SeqScanExecutor
@@ -2257,3 +2291,22 @@ SQL: SELECT student_id FROM students WHERE age > 20;
 ```
 
 ### InsertExecutor
+
+在InsertExecutor中，其向特定的表中插入元组，元组的来源可能为其他计划节点或自定义的元组数组。其具体来源可通过IsRawInsert()提取。在构造函数中，提取其所要插入表的TableInfo，元组来源，以及与表中的所有索引：
+
+```
+InsertExecutor::InsertExecutor(ExecutorContext *exec_ctx, const InsertPlanNode *plan,
+                               std::unique_ptr<AbstractExecutor> &&child_executor)
+    : AbstractExecutor(exec_ctx), plan_(plan), child_executor_(child_executor.release()) {
+  table_oid_t oid = plan->TableOid();
+  table_info_ = exec_ctx->GetCatalog()->GetTable(oid);
+  is_raw_ = plan->IsRawInsert();
+  if (is_raw_) {
+    size_ = plan->RawValues().size();
+  }
+  indexes_ = exec_ctx->GetCatalog()->GetTableIndexes(table_info_->name_);
+}
+
+```
+
+
