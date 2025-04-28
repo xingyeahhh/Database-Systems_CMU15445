@@ -2016,6 +2016,7 @@ plan_ (SeqScanPlanNode对象)
 │
 ├── table_oid_ : 0x1234
 ├── output_schema_ : Schema对象
+├── 插入模式（raw/non-raw)， 如果是raw insert，包含值列表(插入特有)
 └── predicate_ : AbstractExpression* (指向表达式树根节点)
        │
        ↓
@@ -2292,21 +2293,122 @@ SQL: SELECT student_id FROM students WHERE age > 20;
 
 ### InsertExecutor
 
-在InsertExecutor中，其向特定的表中插入元组，元组的来源可能为其他计划节点或自定义的元组数组。其具体来源可通过IsRawInsert()提取。在构造函数中，提取其所要插入表的TableInfo，元组来源，以及与表中的所有索引：
+这个构造函数是 Bustub 中插入操作执行器的初始化部分，在InsertExecutor中，其向特定的表中插入元组，元组的来源可能为其他计划节点或自定义的元组数组。其具体来源可通过IsRawInsert()提取。在构造函数中，提取其所要插入表的TableInfo，元组来源，以及与表中的所有索引：
 
 ```
-InsertExecutor::InsertExecutor(ExecutorContext *exec_ctx, const InsertPlanNode *plan,
-                               std::unique_ptr<AbstractExecutor> &&child_executor)
-    : AbstractExecutor(exec_ctx), plan_(plan), child_executor_(child_executor.release()) {
-  table_oid_t oid = plan->TableOid();
-  table_info_ = exec_ctx->GetCatalog()->GetTable(oid);
+InsertExecutor::InsertExecutor(
+    ExecutorContext *exec_ctx,     // 执行器上下文
+    const InsertPlanNode *plan,    // 插入计划节点
+    std::unique_ptr<AbstractExecutor> &&child_executor)  // 子执行器（用于非raw插入）
+    : AbstractExecutor(exec_ctx),  // 初始化基类
+      plan_(plan),                 // 存储计划节点
+      child_executor_(child_executor.release()) { // 接管子执行器所有权
+  //获取表信息
+  table_oid_t oid = plan->TableOid();  //从计划节点获取目标表的OID
+  table_info_ = exec_ctx->GetCatalog()->GetTable(oid);  //通过目录服务获取表的元信息（TableInfo）
   is_raw_ = plan->IsRawInsert();
+
+  //1. plan_ 包含的插入信息
+  //目标表OID
+  //插入模式（raw/non-raw）
+  //如果是raw insert，包含值列表
+  //输出模式（可能包含返回的插入计数等）
+
+  //2. table_info_ 包含的表信息
+  //表名
+  //表结构（Schema）
+  //表堆（TableHeap）的指针
+  //其他元数据
+
+  //判断是否是"原始值插入"（两种插入方式）：
+  //- Raw Insert：直接插入值（如 INSERT INTO t VALUES (1), (2))
+  //- 非Raw Insert：从子执行器获取数据（如 INSERT INTO t SELECT ...）
+
   if (is_raw_) {
     size_ = plan->RawValues().size();
+    //RawValues()：获取计划节点中存储的原始值列表
+    //size_：记录待插入的元组数量（用于进度跟踪）
   }
   indexes_ = exec_ctx->GetCatalog()->GetTableIndexes(table_info_->name_);
+  //GetTableIndexes()：获取该表的所有索引信息，用途：后续插入数据时需要同步更新所有索引
+    //3. indexes_ 包含的索引信息
+    //索引元数据向量
+    //每个索引包含：
+    //索引OID
+    //索引键模式
+    //索引实现（B+树等）的指针
 }
 
 ```
+**场景1：直接值插入**
 
+INSERT INTO students VALUES (1, 'Alice'), (2, 'Bob');
 
+- is_raw_ = true
+- size_ = 2
+- child_executor_ = nullptr
+
+**场景2：查询结果插入**
+
+INSERT INTO good_students SELECT * FROM students WHERE score > 90;
+- is_raw_ = false
+- child_executor_ 指向一个查询执行器
+
+在Init中，当其元组来源为其他计划节点时，执行对应计划节点的Init()方法：
+
+```
+void InsertExecutor::Init() {
+  if (!is_raw_) {
+    child_executor_->Init();
+  }
+}
+//避免不必要的资源消耗（如 INSERT INTO ... VALUES 时不会初始化查询执行器）
+//直接插入可以免掉（is_raw_ = true）
+
+对于复杂插入（如 INSERT ... SELECT ... WHERE）：
+InsertExecutor.Init()
+  → SeqScanExecutor.Init()
+      → FilterExecutor.Init()----->这块存疑
+```
+**child_executor_ 更准确的说法是数据源执行器：**
+
+- 对于 INSERT...SELECT：它是整个 SELECT 查询的执行器根节点，not RAW, 可能包含多级执行器（如含 Filter、Projection 等）
+- 对于 INSERT...VALUES：它为 nullptr, 数据直接从 plan_->RawValues() 获取
+
+在Next()中，根据不同的元组来源实施不同的插入策略：
+
+```
+bool InsertExecutor::Next([[maybe_unused]] Tuple *tuple, RID *rid) {
+  Transaction *txn = exec_ctx_->GetTransaction();
+  Tuple tmp_tuple;
+  RID tmp_rid;
+  if (is_raw_) {
+    for (uint32_t idx = 0; idx < size_; idx++) {
+      const std::vector<Value> &raw_value = plan_->RawValuesAt(idx);
+      tmp_tuple = Tuple(raw_value, &table_info_->schema_);
+      if (table_info_->table_->InsertTuple(tmp_tuple, &tmp_rid, txn)) {
+        for (auto indexinfo : indexes_) {
+          indexinfo->index_->InsertEntry(
+              tmp_tuple.KeyFromTuple(table_info_->schema_, indexinfo->key_schema_, indexinfo->index_->GetKeyAttrs()),
+              tmp_rid, txn);
+        }
+      }
+    }
+    return false;
+  }
+  while (child_executor_->Next(&tmp_tuple, &tmp_rid)) {
+    if (table_info_->table_->InsertTuple(tmp_tuple, &tmp_rid, txn)) {
+      for (auto indexinfo : indexes_) {
+        indexinfo->index_->InsertEntry(tmp_tuple.KeyFromTuple(*child_executor_->GetOutputSchema(),
+                                                              indexinfo->key_schema_, indexinfo->index_->GetKeyAttrs()),
+                                       tmp_rid, txn);
+      }
+    }
+  }
+  return false;
+}
+```
+
+需要注意，Insert节点不应向外输出任何元组，所以其总是返回假，即所有的插入操作均应当在一次Next中被执行完成。当来源为自定义的元组数组时，根据表模式构造对应的元组，并插入表中；当来源为其他计划节点时，通过子节点获取所有元组并插入表。在插入过程中，应当使用InsertEntry更新表中的所有索引，InsertEntry的参数应由KeyFromTuple方法构造。
+
+### UpdateExecutor与DeleteExecutor
