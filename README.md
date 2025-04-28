@@ -2557,31 +2557,79 @@ WHERE department = 'CS';
     - 更新 score 字段上的所有索引
 
 ```
-
-DeleteExecutor::DeleteExecutor(ExecutorContext *exec_ctx, const DeletePlanNode *plan,
-                               std::unique_ptr<AbstractExecutor> &&child_executor)
-    : AbstractExecutor(exec_ctx), plan_(plan), child_executor_(child_executor.release()) {
+DeleteExecutor::DeleteExecutor(
+     ExecutorContext *exec_ctx,
+     const DeletePlanNode *plan,
+     std::unique_ptr<AbstractExecutor> &&child_executor)
+   : AbstractExecutor(exec_ctx),
+     plan_(plan),
+     child_executor_(child_executor.release()) {
   table_oid_t oid = plan->TableOid();
   auto catalog = exec_ctx->GetCatalog();
   table_info_ = catalog->GetTable(oid);
   indexes_ = catalog->GetTableIndexes(table_info_->name_);
 }
 
+
 void DeleteExecutor::Init() { child_executor_->Init(); }
+
 
 bool DeleteExecutor::Next([[maybe_unused]] Tuple *tuple, RID *rid) {
   auto *txn = this->GetExecutorContext()->GetTransaction();
-  while (child_executor_->Next(tuple, rid)) {
+
+while (child_executor_->Next(tuple, rid)) {
+    //先标记删除表数据 (MarkDelete)
     if (table_info_->table_->MarkDelete(*rid, txn)) {
       for (auto indexinfo : indexes_) {
-        indexinfo->index_->DeleteEntry(tuple->KeyFromTuple(*child_executor_->GetOutputSchema(), indexinfo->key_schema_,
-                                                           indexinfo->index_->GetKeyAttrs()),
-                                       *rid, txn);
+        indexinfo->index_->DeleteEntry(tuple->KeyFromTuple(*child_executor_->GetOutputSchema(), indexinfo->key_schema_,indexinfo->index_->GetKeyAttrs()), *rid, txn);
+    //从索引中删除对应条目
       }
     }
   }
-  return false;
+  return false; //但只需处理删除逻辑，无需生成新元组。
 }
 ```
 
+**Bustub中的MarkDelete**
+
+```
+// table_heap.cpp
+bool TableHeap::MarkDelete(const RID &rid, Transaction *txn) {
+  // 获取页面和元组
+  auto page = buffer_pool_->FetchPage(rid.GetPageId());
+  auto tuple = page->GetData() + rid.GetSlotNum();
+  
+  // 获取锁（检查并发冲突）
+  LockManager::LockRow(txn, rid);  // 可能在此处阻塞或失败
+  
+  // 检查元组有效性
+  if (tuple->IsNull()) {          // 检查元组是否存在
+    return false;
+  }
+  
+  // 验证事务可见性（MVCC检查）
+  if (!txn->IsVisible(tuple->GetTransactionId())) {
+    return false;
+  }
+  
+  // 执行标记删除
+  tuple->SetDeleted(true);        // 设置删除标记位
+  tuple->SetTransactionId(txn->GetTransactionId()); // 记录删除事务
+  
+  // 写入日志（可选）
+  WriteDeleteLog(txn, rid);
+  
+  return true;
+}
+```
+所以上文中的，当看到 if (MarkDelete(...)) 时，实际上发生了：
+- 进入函数立即加锁（排他锁）
+- 在锁保护下连续执行：
+  - 存在性检查
+  - 可见性验证
+  - 实际标记删除
+- 根据结果返回：
+  - true：表示已完成标记删除
+  - false：表示因冲突未执行删除
+ 
 ### NestedLoopJoinExecutor
