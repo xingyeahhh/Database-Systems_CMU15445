@@ -2028,6 +2028,23 @@ plan_ (SeqScanPlanNode对象)
 ```
 在bustub中，每个查询计划节点AbstractPlanNode都被包含在执行器类AbstractExecutor中，用户通过执行器类调用查询计划的Next()方法及初始化Init()方法，而查询计划节点中则保存该操作所需的特有信息，如顺序扫描需要在节点中保存其所要扫描的表标识符、连接需要在节点中保存其子节点及连接的谓词。同时。执行器类中也包含ExecutorContext上下文信息，其代表了查询计划的全局信息，如事务、事务管理器、锁管理器等。
 
+**一些基本概念**
+- table_oid_t oid = plan->TableOid() 获取更新计划节点中存储的表对象标识符(OID)，这是表的唯一标识
+- auto catalog = exec_ctx->GetCatalog() 从执行上下文中获取数据库目录(Catalog)，目录是存储所有数据库对象元数据的地方
+- table_info_ = catalog->GetTable(oid) 使用表的OID从目录中检索该表的完整信息，并将结果存储在 table_info_ 成员变量中
+- ExecutorContext *exec_ctx (执行上下文):
+  - 包含执行SQL语句所需的环境信息
+  - 提供对事务管理器、目录、存储引擎等系统组件的访问
+  - 存储事务状态、授权信息等
+- const XXXPlanNode *plan (更新计划节点):
+  - 由查询优化器生成的更新操作的计划
+  - 包含如何执行更新操作的详细信息
+  - 存储目标表OID、要更新的列等信息
+- std::unique_ptr<AbstractExecutor> &&child_executor (子执行器):
+  - 提供要更新的行(tuples)的来源
+  - 通常是查询执行计划的另一部分，负责找出满足更新条件的记录
+  - 使用右值引用(&&)和unique_ptr实现所有权转移，确保资源管理安全
+  
 ### SeqScanExecutor
 
 SeqScanExecutor执行顺序扫描操作，其通过Next()方法顺序遍历其对应表中的所有元组，并将元组返回至调用者。在bustub中，所有与表有关的信息被包含在TableInfo中：
@@ -2466,13 +2483,20 @@ Tuple key = tuple.KeyFromTuple(
 UpdateExecutor与DeleteExecutor用于从特定的表中更新、删除元组，其实现方法与InsertExecutor相似，但其元组来源仅为其他计划节点：
 
 ```
+UpdateExecutor::UpdateExecutor(
+    ExecutorContext *exec_ctx,                          // 执行上下文
+    const UpdatePlanNode *plan,                         // 更新计划节点
+    std::unique_ptr<AbstractExecutor> &&child_executor) // 数据源执行器
+    : AbstractExecutor(exec_ctx),
+      plan_(plan),
+      child_executor_(child_executor.release()) {
 
-UpdateExecutor::UpdateExecutor(ExecutorContext *exec_ctx, const UpdatePlanNode *plan,
-                               std::unique_ptr<AbstractExecutor> &&child_executor)
-    : AbstractExecutor(exec_ctx), plan_(plan), child_executor_(child_executor.release()) {
+  // 获取表元数据
   table_oid_t oid = plan->TableOid();
   auto catalog = exec_ctx->GetCatalog();
   table_info_ = catalog->GetTable(oid);
+
+  // 获取表的所有索引
   indexes_ = catalog->GetTableIndexes(table_info_->name_);
 }
 
