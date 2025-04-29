@@ -2651,9 +2651,9 @@ NestedLoopJoinExecutor::NestedLoopJoinExecutor(
 
 
 void NestedLoopJoinExecutor::Init() {
-  left_executor_->Init();                    // 初始化左表执行器，处理左表数据
-  right_executor_->Init();                   // 初始化右表执行器，处理右表数据
-  buffer_.clear();                           // 清空结果缓存
+  left_executor_->Init();       // 初始化左表执行器，处理左表数据，处理状态重置到起始位置
+  right_executor_->Init();      // 初始化右表执行器，处理右表数据，处理状态重置到起始位置
+  buffer_.clear();              // 清空结果缓存
 
   const Schema *left_schema = plan_->GetLeftPlan()->OutputSchema();
   const Schema *right_schema = plan_->GetRightPlan()->OutputSchema();
@@ -2719,3 +2719,6 @@ ON a.id = b.id
   - 缓存所有匹配结果
   - 逐个返回结果
 
+- 物化策略：这是典型的"物化嵌套循环连接"，在Init中预先计算所有结果
+  - 优点：Next调用时不再需要执行复杂操作，适合结果集较小的情况
+  - 缺点：可能消耗大量内存存储中间结果
