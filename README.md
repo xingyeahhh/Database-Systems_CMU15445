@@ -2722,3 +2722,175 @@ ON a.id = b.id
 - 物化策略：这是典型的"物化嵌套循环连接"，在Init中预先计算所有结果
   - 优点：Next调用时不再需要执行复杂操作，适合结果集较小的情况
   - 缺点：可能消耗大量内存存储中间结果
+ 
+ ### HashJoinExecutor
+ 
+HashJoinExecutor使用基础哈希连接算法进行连接操作，其原理为将元组的连接键（即某些属性列的组合）作为哈希表的键，并使用其中一个子计划节点的元组构造哈希表。由于具有相同连接键的元组一定具有相同的哈希键值，因此另一个子计划节点中的元组仅需在该元组映射的桶中寻找可与其连接的元组，如下图所示：
+
+ <img src="https://github.com/user-attachments/assets/c3499a95-a3a3-4380-980d-3d86fc4dfee0" 
+     alt="image" 
+     style="width:95%; max-width:600px;">
+
+为了使得元组可以被插入哈希表，需要为元组的连接键设定对应的哈希函数，以及其连接键的比较方法：
+
+```
+struct HashJoinKey {
+  Value value_;             // 存储连接键的实际值
+
+  // 相等比较运算符重载
+  bool operator==(const HashJoinKey &other) const { return value_.CompareEquals(other.value_) == CmpBool::CmpTrue; }      //CmpBool 包含 CmpTrue/CmpFalse/CmpNull
+};
+
+
+// namespace bustub
+namespace std {
+/** Implements std::hash on AggregateKey */
+template <>
+struct hash<bustub::HashJoinKey> {
+  std::size_t operator()(const bustub::HashJoinKey &key) const {
+       return bustub::HashUtil::HashValue(&key.value_); }
+};
+
+//HashUtil 提供类型感知的哈希计算
+//特性：
+//相同值必然产生相同哈希
+//不同值大概率产生不同哈希
+//处理NULL值等特殊情况
+
+//运算符重载：代码中定义的 operator() 让 hash<HashJoinKey> 的实例可以像函数一样使用
+
+当你在哈希表中使用 HashJoinKey 作为键时，例如：
+std::unordered_map<HashJoinKey, Tuple> hash_table;
+or
+hash_table.insert({HashJoinKey{value}, tuple});
+
+以下是幕后发生的事情：
+1.unordered_map 需要计算键的哈希值
+2.它会创建并使用 std::hash<HashJoinKey> 的实例
+3.当需要哈希某个键时，它会调用这个实例的 operator()：
+
+std::hash<HashJoinKey> hasher;
+size_t hash_value = hasher(some_key);  // 调用operator()
+
+4.我们特化的函数被调用，计算并返回哈希值
+```
+
+对于哈希函数，使用bustub中内置的HashUtil::HashValue即可。在这里，通过阅读代码可以发现，bustub中连接操作的连接键仅由元组的一个属性列组成，因此在连接键中仅需存放单个属性列的具体值Value，而不需同聚合操作一样存放属性列的组合Vector<Value>。连接键通过Value的CompareEquals进行比较。
+
+```
+//定义了HashJoinExecutor类的私有成员变量
+ private:
+  /** The NestedLoopJoin plan node to be executed. */
+  const HashJoinPlanNode *plan_;
+
+  std::unique_ptr<AbstractExecutor> left_child_;
+
+  std::unique_ptr<AbstractExecutor> right_child_;
+
+  std::unordered_multimap<HashJoinKey, Tuple> hash_map_{};
+  //使用 unordered_multimap 自动处理重复键
+  std::vector<Tuple> output_buffer_;
+};
+```
+
+在HashJoinExecutor中，使用unordered_multimap直接存放对于连接键的元组，从原理上其与使用普通哈希表并遍历桶的过程上是等价的，但使用multimap会使实现代码更加简单。
+
+```
+
+HashJoinExecutor::HashJoinExecutor(
+      ExecutorContext *exec_ctx, const HashJoinPlanNode *plan,
+      std::unique_ptr<AbstractExecutor> &&left_child,
+      std::unique_ptr<AbstractExecutor> &&right_child)
+    : AbstractExecutor(exec_ctx),
+      plan_(plan),
+      left_child_(left_child.release()),
+      right_child_(right_child.release()) {}
+
+
+
+void HashJoinExecutor::Init() {
+
+  // 初始化左右子执行器
+  left_child_->Init();
+  right_child_->Init();
+
+  // 清空哈希表和输出缓冲区
+  hash_map_.clear();
+  output_buffer_.clear();
+
+  // 构建哈希表阶段，准备变量
+  Tuple left_tuple;
+  const Schema *left_schema = left_child_->GetOutputSchema();
+  RID rid;
+
+  // 遍历左表所有元组构建哈希表
+  while (left_child_->Next(&left_tuple, &rid)) {
+    // 计算左表连接键值，使用 LeftJoinKeyExpression 提取连接键
+    HashJoinKey left_key;
+    left_key.value_ = plan_->LeftJoinKeyExpression()->Evaluate(&left_tuple, left_schema);
+    // 将键值对插入哈希表
+    hash_map_.emplace(left_key, left_tuple);
+  }
+}
+```
+
+在Init()中，HashJoinExecutor遍历左子计划节点的元组，以完成哈希表的构建操作。
+
+```
+
+bool HashJoinExecutor::Next(Tuple *tuple, RID *rid) {
+  // 检查输出缓冲区是否有缓存结果
+  if (!output_buffer_.empty()) {
+    *tuple = output_buffer_.back();
+    output_buffer_.pop_back();
+    return true;
+  }
+
+  // 准备探测阶段的变量
+  Tuple right_tuple;
+  const Schema *left_schema = left_child_->GetOutputSchema();
+  const Schema *right_schema = right_child_->GetOutputSchema();
+  const Schema *out_schema = GetOutputSchema();
+
+  // 遍历右表元组
+  while (right_child_->Next(&right_tuple, rid)) {
+    // 计算右表连接键
+    HashJoinKey right_key;
+    right_key.value_ = plan_->RightJoinKeyExpression()->Evaluate(&right_tuple, right_schema);
+
+    // 在哈希表中查找匹配
+    auto iter = hash_map_.find(right_key);
+    uint32_t num = hash_map_.count(right_key);
+
+    // 处理所有匹配的左表元组
+    for (uint32_t i = 0; i < num; ++i, ++iter) {
+      std::vector<Value> values;
+
+       // 构造输出元组的各列值
+      for (const auto &col : out_schema->GetColumns()) {
+        values.emplace_back(
+           col.GetExpr()->EvaluateJoin(
+              &iter->second,      // 左表元组
+               left_schema,       // 左表模式
+              &right_tuple,       // 右表元组
+              right_schema        // 右表模式
+            )
+         );
+      }
+      // 将连接结果存入缓冲区
+      output_buffer_.emplace_back(values, out_schema);
+    }
+
+    // 如果缓冲区有数据，立即返回一条
+    if (!output_buffer_.empty()) {
+      *tuple = output_buffer_.back();
+      output_buffer_.pop_back();
+      return true;
+    }
+  }
+  // 右表遍历完成且无结果
+  return false;
+}
+```
+
+在Next()中，使用右子计划节点的元组作为"探针"，以寻找与其连接键相同的左子计划节点的元组。需要注意的是，一个右节点的元组可能有多个左节点的元组与其对应，但一次Next()操作仅返回一个结果连接元组。因此在一次Next()中应当将连接得到的所有结果元组存放在output_buffer_缓冲区中，使得在下一次Next()中仅需从缓冲区中提取结果元组，而不调用子节点的Next()方法。
