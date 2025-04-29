@@ -2845,7 +2845,9 @@ void HashJoinExecutor::Init() {
 <img src="https://github.com/user-attachments/assets/0e3a7731-dd64-4f79-9cb1-2ffa8985b71e" 
      alt="image" 
      style="width:80%; max-width:600px;">
+
 **例子**
+
 ```
 void HashJoinExecutor::Init() {
   // 初始化
@@ -3110,3 +3112,141 @@ Next() 调用：
 通过 EvaluateJoin 支持复杂表达式
 ```
 
+### AggregationExecutor
+
+AggregationExecutor实现聚合操作，其原理为使用哈希表将所有聚合键相同的元组映射在一起，以此统计所有聚合键元组的聚合信息：
+
+```
+ private:
+  /** The aggregation plan node */
+  const AggregationPlanNode *plan_;
+  /** The child executor that produces tuples over which the aggregation is computed */
+  std::unique_ptr<AbstractExecutor> child_;
+  /** Simple aggregation hash table */
+  // TODO(Student): Uncomment SimpleAggregationHashTable aht_;
+  // 聚合哈希表
+  SimpleAggregationHashTable hash_table_;
+  /** Simple aggregation hash table iterator */
+  // TODO(Student): Uncomment SimpleAggregationHashTable::Iterator aht_iterator_;
+  SimpleAggregationHashTable::Iterator iter_;
+};
+```
+
+SimpleAggregationHashTable为用于聚合操作的哈希表，其以聚合键（即元组的属性列组合）作为键，并以聚合的统计结果组合（聚合键相同元组的SUM、AVG、MIN等统计量的组合）作为值。其设置了用于遍历其元素的迭代器。
+
+```
+
+AggregationExecutor::AggregationExecutor(
+      ExecutorContext *exec_ctx,
+      const AggregationPlanNode *plan,
+      std::unique_ptr<AbstractExecutor> &&child)
+    : AbstractExecutor(exec_ctx),
+      plan_(plan),
+      child_(child.release()),
+      hash_table_(plan->GetAggregates(), plan->GetAggregateTypes()),
+      // hash_table_ 使用聚合表达式和类型初始化
+      iter_(hash_table_.Begin()) {}
+
+
+
+void AggregationExecutor::Init() {
+  Tuple tuple;
+  RID rid;
+  child_->Init(); // 初始化数据源
+
+  // 聚合计算阶段
+  while (child_->Next(&tuple, &rid)) {
+    hash_table_.InsertCombine(
+       MakeAggregateKey(&tuple),    // 生成分组键
+       MakeAggregateValue(&tuple)   // 生成聚合值
+    );
+  }
+  iter_ = hash_table_.Begin();      // 重置迭代器
+}
+```
+
+1. MakeAggregateKey
+```
+AggregateKey MakeAggregateKey(Tuple *tuple) {
+  std::vector<Value> keys;
+  for (const auto &expr : plan_->GetGroupBys()) {
+    keys.emplace_back(expr->Evaluate(tuple, child_->GetOutputSchema()));
+  }
+  return {keys};
+}
+
+作用：根据 GROUP BY 列生成分组键
+示例：GROUP BY dept → 提取 dept 列值
+```
+
+2. MakeAggregateValue
+```
+AggregateValue MakeAggregateValue(Tuple *tuple) {
+  std::vector<Value> vals;
+  for (const auto &expr : plan_->GetAggregates()) {
+    vals.emplace_back(expr->Evaluate(tuple, child_->GetOutputSchema()));
+  }
+  return {vals};
+}
+作用：准备待聚合的原始值
+示例：SUM(salary) → 提取 salary 值
+```
+
+在Init()中，遍历子计划节点的元组，并构建哈希表及设置用于遍历该哈希表的迭代器。InsertCombine将当前聚合键的统计信息更新：
+
+```
+  void InsertCombine(const AggregateKey &agg_key, const AggregateValue &agg_val) {
+    if (ht_.count(agg_key) == 0) {
+      ht_.insert({agg_key, GenerateInitialAggregateValue()});
+    }
+    CombineAggregateValues(&ht_[agg_key], agg_val);
+  }
+```
+
+```
+  void CombineAggregateValues(AggregateValue *result, const AggregateValue &input) {
+    for (uint32_t i = 0; i < agg_exprs_.size(); i++) {
+      switch (agg_types_[i]) {
+        case AggregationType::CountAggregate:
+          // Count increases by one.
+          result->aggregates_[i] = result->aggregates_[i].Add(ValueFactory::GetIntegerValue(1));
+          break;
+        case AggregationType::SumAggregate:
+          // Sum increases by addition.
+          result->aggregates_[i] = result->aggregates_[i].Add(input.aggregates_[i]);
+          break;
+        case AggregationType::MinAggregate:
+          // Min is just the min.
+          result->aggregates_[i] = result->aggregates_[i].Min(input.aggregates_[i]);
+          break;
+        case AggregationType::MaxAggregate:
+          // Max is just the max.
+          result->aggregates_[i] = result->aggregates_[i].Max(input.aggregates_[i]);
+          break;
+      }
+    }
+  }
+```
+
+在Next()中，使用迭代器遍历哈希表，如存在谓词，则使用谓词的EvaluateAggregate判断当前聚合键是否符合谓词，如不符合则继续遍历直到寻找到符合谓词的聚合键。
+
+```
+bool AggregationExecutor::Next(Tuple *tuple, RID *rid) {
+  while (iter_ != hash_table_.End()) {
+    auto *having = plan_->GetHaving();
+    const auto &key = iter_.Key().group_bys_;
+    const auto &val = iter_.Val().aggregates_;
+    if (having == nullptr || having->EvaluateAggregate(key, val).GetAs<bool>()) {
+      std::vector<Value> values;
+      for (const auto &col : GetOutputSchema()->GetColumns()) {
+        values.emplace_back(col.GetExpr()->EvaluateAggregate(key, val));
+      }
+      *tuple = Tuple(values, GetOutputSchema());
+      ++iter_;
+      return true;
+    }
+    ++iter_;
+  }
+  return false;
+}
+```
