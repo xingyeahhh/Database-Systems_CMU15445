@@ -180,8 +180,7 @@ data_[i][j] == *(data_[i] + j) == linear_[i * cols + j]
 266     return ret;
 267   }
 ...
-277   static std::unique_ptr<RowMatrix<T>> GEMM(const RowMatrix<T> *matrixA, const RowMatrix<T> *matr    ixB,
-278                                             const RowMatrix<T> *matrixC) {
+277   static std::unique_ptr<RowMatrix<T>> GEMM(const RowMatrix<T> *matrixA, const RowMatrix<T> *matrixB, const RowMatrix<T> *matrixC) {
 279     // TODO(P0): Add implementation
 280     if (matrixA->GetColumnCount() != matrixB->GetRowCount()) {
 281       return std::unique_ptr<RowMatrix<T>>(nullptr);
@@ -2828,10 +2827,183 @@ void HashJoinExecutor::Init() {
     // 计算左表连接键值，使用 LeftJoinKeyExpression 提取连接键
     HashJoinKey left_key;
     left_key.value_ = plan_->LeftJoinKeyExpression()->Evaluate(&left_tuple, left_schema);
+
     // 将键值对插入哈希表
+    //***HashJoinKey 结构体有一个 value_ 成员变量***！！！
+    //LeftJoinKeyExpression() 返回一个表达式，用于从左表元组中提取连接键的值
+    //Evaluate() 对给定元组评估表达式，返回一个 Value 对象
+    //假如读取第一条左表元组：(id=1, name="Alice")
+    //left_key.value_ 就是Value(1) (id列的值)，1纯粹是那个值
+
     hash_map_.emplace(left_key, left_tuple);
+    //相对应的就是，hash_map_.emplace(HashJoinKey{Value(1)}, Tuple(1, "Alice"));
   }
 }
+
+```
+
+<img src="https://github.com/user-attachments/assets/0e3a7731-dd64-4f79-9cb1-2ffa8985b71e" 
+     alt="image" 
+     style="width:80%; max-width:600px;">
+**例子**
+```
+void HashJoinExecutor::Init() {
+  // 初始化
+  left_child_->Init();  // 初始化Students表扫描
+  right_child_->Init(); // 初始化Scores表扫描
+  hash_map_.clear();
+  
+  Tuple left_tuple;
+  RID rid;
+  
+  // 扫描左表(Students)
+  while (left_child_->Next(&left_tuple, &rid)) {
+    HashJoinKey left_key;
+    // 假设LeftJoinKeyExpression指向id列
+    // 对于Alice: left_key.value_ = Value(1)
+    // 对于Bob: left_key.value_ = Value(2)
+    left_key.value_ = plan_->LeftJoinKeyExpression()->Evaluate(&left_tuple, left_schema);
+    
+    // 将(键,元组)对加入哈希表
+    // 对于Alice: hash_map_[Value(1)] = {id:1, name:"Alice"}
+    // 对于Bob: hash_map_[Value(2)] = {id:2, name:"Bob"}
+    hash_map_.emplace(left_key, left_tuple);
+  }
+  // 哈希表现在包含 {1: {id:1, name:"Alice"}, 2: {id:2, name:"Bob"}}
+}
+
+
+bool HashJoinExecutor::Next(Tuple *tuple, RID *rid) {
+  // 如果缓冲区有结果，直接返回
+  if (!output_buffer_.empty()) {
+    *tuple = output_buffer_.back();
+    output_buffer_.pop_back();
+    return true;
+  }
+  
+  // 处理下一个右表元组
+  Tuple right_tuple;
+  while (right_child_->Next(&right_tuple, rid)) {
+    HashJoinKey right_key;
+    // 假设RightJoinKeyExpression指向id列
+    // 第一次调用: right_key.value_ = Value(1) (Math成绩记录)
+    right_key.value_ = plan_->RightJoinKeyExpression()->Evaluate(&right_tuple, right_schema);
+    
+    // 在哈希表中查找匹配项
+    auto iter = hash_map_.find(right_key);
+    uint32_t num = hash_map_.count(right_key);
+    
+    // 处理所有匹配的左表元组
+    // 对于Math成绩记录(id=1): 找到Alice元组
+    for (uint32_t i = 0; i < num; ++i, ++iter) {
+      std::vector<Value> values;
+      for (const auto &col : out_schema->GetColumns()) {
+        // 例如: 如果输出模式是 {name, subject, score}
+        // 对于第一列(name): 从左表取"Alice"
+        // 对于第二列(subject): 从右表取"Math"
+        // 对于第三列(score): 从右表取90
+        values.emplace_back(
+          col.GetExpr()->EvaluateJoin(
+            &iter->second,    // 左表元组 {id:1, name:"Alice"}
+            left_schema,      // 左表模式
+            &right_tuple,     // 右表元组 {id:1, subject:"Math", score:90}
+            right_schema      // 右表模式
+          )
+        );
+      }
+      // 创建连接结果 {name:"Alice", subject:"Math", score:90}
+      output_buffer_.emplace_back(values, out_schema);
+    }
+    
+    // 如果生成了结果，返回第一个
+    if (!output_buffer_.empty()) {
+      *tuple = output_buffer_.back();
+      output_buffer_.pop_back();
+      return true;  // 返回 {name:"Alice", subject:"Math", score:90}
+    }
+  }
+  
+  return false;  // 无更多结果
+}
+
+第一次调用Next: 返回 {name:"Alice", subject:"Math", score:90}
+第二次调用Next: 返回 {name:"Alice", subject:"English", score:85}
+第三次调用Next: 返回 false (id=3没有匹配项，处理完所有数据)
+
+这样，整个哈希连接过程就完成了两表的连接操作，生成了满足连接条件的所有结果。
+```
+
+ **value的本质是什么？？？**
+- Value 是 Bustub 中表示 SQL 数据类型的通用容器类，可以理解为：
+  - 一个能存放各种SQL类型的联合体（INTEGER、VARCHAR、BOOLEAN等）
+  -  提供类型安全的操作接口
+
+```
+// 假设左表元组内存布局：
+// [4字节int id][20字节varchar name]
+Tuple left_tuple = (id=1, name="Alice");
+
+// 1. 提取id值
+Value id_value = left_tuple.GetValue(schema, 0); // Value(1)
+
+// 2. 构造哈希键
+HashJoinKey key{id_value}; // 现在 key.value_ = Value(1)
+
+// 3. 计算哈希（伪代码）
+size_t hash = std::hash<int>{}(1); // 假设实际调用链最终落在此处
+
+// 4. 插入哈希表
+hash_map_.emplace(key, left_tuple);
+
+数据库需要处理：
+
+SELECT 1;                    -- 整数
+SELECT '1';                  -- 字符串
+SELECT 1.0;                  -- 浮点数
+SELECT NULL;                 -- 空值
+
+这些在SQL中都是不同的类型，但C++的 int 无法区分它们。
+
+二，Value 类的核心职责
+1. 统一类型容器
+class Value {
+  TypeId type_;  // 类型标识
+  union {
+    int32_t integer_;
+    char *varlen_;
+    // ...其他类型
+  };
+};
+内存布局：用联合体(union)存储各种类型
+类型安全：通过 type_ 字段确保正确解释存储的值
+
+三，在哈希连接中的具体必要性
+1. 类型感知的哈希计算
+// 对于不同类型，哈希计算方式不同
+hash("1") != hash(1) != hash(1.0)
+
+Value 类内部会根据类型调用正确的哈希函数：
+size_t HashValue(const Value *val) {
+  switch (val->type_) {
+    case INTEGER: return HashInt(val->integer_);
+    case VARCHAR: return HashString(val->varlen_);
+    // ...
+  }
+}
+
+2. 连接条件的灵活处理
+考虑以下SQL：
+
+-- 情况1：整数id匹配
+SELECT * FROM a JOIN b ON a.id = b.id  
+
+-- 情况2：字符串id匹配
+SELECT * FROM a JOIN b ON a.code = b.code
+
+-- 情况3：混合类型匹配（需类型转换）
+SELECT * FROM a JOIN b ON a.id = CAST(b.code AS INT)
+
+Value 类可以统一处理这些情况，而原生类型无法做到。
 ```
 
 在Init()中，HashJoinExecutor遍历左子计划节点的元组，以完成哈希表的构建操作。
