@@ -3196,17 +3196,33 @@ AggregateValue MakeAggregateValue(Tuple *tuple) {
 
 ```
   void InsertCombine(const AggregateKey &agg_key, const AggregateValue &agg_val) {
+    // 检查键是否已存在
     if (ht_.count(agg_key) == 0) {
+      // 不存在则插入初始值
       ht_.insert({agg_key, GenerateInitialAggregateValue()});
     }
+    // 合并聚合值
     CombineAggregateValues(&ht_[agg_key], agg_val);
   }
+
+GenerateInitialAggregateValue() 生成各聚合的初始状态：
+COUNT: 0
+SUM: 0
+MIN: +∞
+MAX: -∞
+
+值合并：无论新旧键都会执行 CombineAggregateValues
 ```
+- 示例场景：
+  - 第一个 (dept="IT", salary=5000) 进入：
+  - 插入新键 "IT"，初始值 (count=0, sum=0, min=+∞, max=-∞)
+  - 合并后变为 (count=1, sum=5000, min=5000, max=5000)
 
 ```
   void CombineAggregateValues(AggregateValue *result, const AggregateValue &input) {
+    // 遍历所有聚合表达式
     for (uint32_t i = 0; i < agg_exprs_.size(); i++) {
-      switch (agg_types_[i]) {
+      switch (agg_types_[i]) { // 根据聚合类型处理
         case AggregationType::CountAggregate:
           // Count increases by one.
           result->aggregates_[i] = result->aggregates_[i].Add(ValueFactory::GetIntegerValue(1));
@@ -3226,27 +3242,73 @@ AggregateValue MakeAggregateValue(Tuple *tuple) {
       }
     }
   }
+聚合类型处理细节：
+聚合类型	  操作逻辑	  示例演变
+COUNT	     每次+1	  0 → 1 → 2
+SUM	       累加值	   0 → 5000 → 11000
+MIN	      保留较小值	∞ → 5000 → 5000
+MAX	      保留较大值	-∞ → 5000 → 6000
+重要说明：
+Value 的 Add/Min/Max 方法保证了类型安全的运算
+ValueFactory::GetIntegerValue(1) 创建临时值避免重复构造
 ```
 
 在Next()中，使用迭代器遍历哈希表，如存在谓词，则使用谓词的EvaluateAggregate判断当前聚合键是否符合谓词，如不符合则继续遍历直到寻找到符合谓词的聚合键。
 
 ```
 bool AggregationExecutor::Next(Tuple *tuple, RID *rid) {
+  // 遍历哈希表结果
   while (iter_ != hash_table_.End()) {
     auto *having = plan_->GetHaving();
-    const auto &key = iter_.Key().group_bys_;
-    const auto &val = iter_.Val().aggregates_;
+    const auto &key = iter_.Key().group_bys_;   // 分组键
+    const auto &val = iter_.Val().aggregates_;  // 聚合值
+
+    // HAVING子句过滤
     if (having == nullptr || having->EvaluateAggregate(key, val).GetAs<bool>()) {
+
+      // 构造输出元组
       std::vector<Value> values;
       for (const auto &col : GetOutputSchema()->GetColumns()) {
         values.emplace_back(col.GetExpr()->EvaluateAggregate(key, val));
       }
       *tuple = Tuple(values, GetOutputSchema());
-      ++iter_;
+      ++iter_;     // 移动迭代器
       return true;
     }
-    ++iter_;
+    ++iter_;       // 跳过不满足HAVING的分组
   }
-  return false;
+  return false;    // 无更多结果
 }
+
+1. HAVING过滤：
+having->EvaluateAggregate(key, val) 示例：
+-- 对应HAVING SUM(salary) > 10000
+-- 会计算 val[sum_index] > 10000
+
+2. 输出元组构造：
+对输出模式的每一列调用 EvaluateAggregate
+可能包含：
+   分组列（直接取自 key）
+   聚合结果（取自 val）
+   计算列（如 SUM(salary)*1.1）
+
+3. 迭代器管理：
+无论是否通过HAVING都会推进迭代器
+只有通过HAVING才返回结果
+
+示例
+["IT"]   : (count=2, sum=11000, min=5000, max=6000)
+["HR"]   : (count=1, sum=4000, min=4000, max=4000)
+["Sales"]: (count=3, sum=15000, min=3000, max=7000)
+
+HAVING条件：SUM(salary) > 10000
+输出流程：
+"IT" → 11000 > 10000 → 输出
+"HR" → 4000 ≤ 10000 → 跳过
+"Sales" → 15000 > 10000 → 输出
 ```
+
+
+
+
+
