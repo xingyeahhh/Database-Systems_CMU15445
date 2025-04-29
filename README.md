@@ -3157,8 +3157,8 @@ void AggregationExecutor::Init() {
   // 聚合计算阶段
   while (child_->Next(&tuple, &rid)) {
     hash_table_.InsertCombine(
-       MakeAggregateKey(&tuple),    // 生成分组键
-       MakeAggregateValue(&tuple)   // 生成聚合值
+       MakeAggregateKey(&tuple),    // 生成分组键，GROUP BY 的实现，GROUP BY列生成分组键
+       MakeAggregateValue(&tuple)   // 生成聚合值， 待聚合的原始值
     );
   }
   iter_ = hash_table_.Begin();      // 重置迭代器
@@ -3263,7 +3263,7 @@ bool AggregationExecutor::Next(Tuple *tuple, RID *rid) {
     const auto &key = iter_.Key().group_bys_;   // 分组键
     const auto &val = iter_.Val().aggregates_;  // 聚合值
 
-    // HAVING子句过滤
+    // HAVING子句过滤，HAVING 的实现
     if (having == nullptr || having->EvaluateAggregate(key, val).GetAs<bool>()) {
 
       // 构造输出元组
@@ -3306,9 +3306,143 @@ HAVING条件：SUM(salary) > 10000
 "IT" → 11000 > 10000 → 输出
 "HR" → 4000 ≤ 10000 → 跳过
 "Sales" → 15000 > 10000 → 输出
+
+WHERE在聚合前过滤单行数据
+HAVING在聚合后过滤整个分组
+
+例子：
+SELECT dept, AVG(salary) 
+FROM employees 
+WHERE hire_year > 2010         -- WHERE条件
+GROUP BY dept                  -- 分组列
+HAVING AVG(salary) > 5000      -- HAVING条件
+
+1. WHERE过滤（由子执行器完成）：
+// 在child_executor中（如SelectionExecutor）
+if (tuple.GetValue(schema, hire_year_idx) <= 2010) {
+  continue;  // 跳过不符合WHERE条件的记录
+}
+
+2. GROUP BY聚合 ：
+// 分组键：dept列值
+AggregateKey key{tuple.GetValue(schema, dept_idx)};
+
+// 聚合值：salary
+AggregateValue val{tuple.GetValue(schema, salary_idx)};
+
+// 更新哈希表（SUM和COUNT同时维护）
+hash_table_[key].sum_salary += val.salary;
+hash_table_[key].count++;
+
+3. HAVING过滤：
+// 计算每个分组的AVG(salary) = sum/count
+if (hash_table_[key].sum_salary / hash_table_[key].count > 5000) {
+  // 输出该分组
+}
 ```
 
+<img src="https://github.com/user-attachments/assets/420ec517-875e-4555-9fcf-82c1e1ab3b55" 
+     alt="image" 
+     style="width:70%; max-width:600px;">
 
 
+### LimitExecutor
 
+LimitExecutor用于限制输出元组的数量，其计划节点中定义了具体的限制数量。其Init()应当调用子计划节点的Init()方法，并重置当前限制数量；Next()方法则将子计划节点的元组返回，直至限制数量为0。
 
+```
+LimitExecutor::LimitExecutor(ExecutorContext *exec_ctx, const LimitPlanNode *plan,
+                             std::unique_ptr<AbstractExecutor> &&child_executor)
+    : AbstractExecutor(exec_ctx), plan_(plan), child_executor_(child_executor.release()) {
+  limit_ = plan_->GetLimit();
+}
+
+void LimitExecutor::Init() {
+  child_executor_->Init();
+  limit_ = plan_->GetLimit();
+}
+
+bool LimitExecutor::Next(Tuple *tuple, RID *rid) {
+  if (limit_ == 0 || !child_executor_->Next(tuple, rid)) {
+    return false;
+  }
+  --limit_;
+  return true;
+}
+```
+
+### DistinctExecutor
+
+DistinctExecutor用于去除相同的输入元组，并将不同的元组输出。在这里使用哈希表方法去重，哈希表的具体构建策略参照了聚合执行器中的SimpleAggregationHashTable：
+
+```
+namespace bustub {
+struct DistinctKey {
+  std::vector<Value> value_;
+  bool operator==(const DistinctKey &other) const {
+    for (uint32_t i = 0; i < other.value_.size(); i++) {
+      if (value_[i].CompareEquals(other.value_[i]) != CmpBool::CmpTrue) {
+        return false;
+      }
+    }
+    return true;
+  }
+};
+
+}  // namespace bustub
+
+namespace std {
+
+/** Implements std::hash on AggregateKey */
+template <>
+struct hash<bustub::DistinctKey> {
+  std::size_t operator()(const bustub::DistinctKey &key) const {
+    size_t curr_hash = 0;
+    for (const auto &value : key.value_) {
+      if (!value.IsNull()) {
+        curr_hash = bustub::HashUtil::CombineHashes(curr_hash, bustub::HashUtil::HashValue(&value));
+      }
+    }
+    return curr_hash;
+  }
+};
+...
+
+class DistinctExecutor : public AbstractExecutor {
+...
+  std::unordered_set<DistinctKey> set_;
+
+  DistinctKey MakeKey(const Tuple *tuple) {
+    std::vector<Value> values;
+    const Schema *schema = GetOutputSchema();
+    for (uint32_t i = 0; i < schema->GetColumnCount(); ++i) {
+      values.emplace_back(tuple->GetValue(schema, i));
+    }
+    return {values};
+  }
+};
+```
+
+在实际运行中，使用哈希表去重即。Init()清空当前哈希表，并初始化子计划节点。Next()判断当前元组是否已经出现在哈希表中，如是则遍历下一个输入元组，如非则将该元组插入哈希表并返回：
+
+```
+DistinctExecutor::DistinctExecutor(ExecutorContext *exec_ctx, const DistinctPlanNode *plan,
+                                   std::unique_ptr<AbstractExecutor> &&child_executor)
+    : AbstractExecutor(exec_ctx), plan_(plan), child_executor_(child_executor.release()) {}
+
+void DistinctExecutor::Init() {
+  set_.clear();
+  child_executor_->Init();
+}
+
+bool DistinctExecutor::Next(Tuple *tuple, RID *rid) {
+  while (child_executor_->Next(tuple, rid)) {
+    auto key = MakeKey(tuple);
+    if (set_.count(key) == 0U) {
+      set_.insert(key);
+      return true;
+    }
+  }
+  return false;
+}
+```
