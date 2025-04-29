@@ -2638,35 +2638,49 @@ bool TableHeap::MarkDelete(const RID &rid, Transaction *txn) {
 NestedLoopJoinExecutor将两个子计划节点中的所有元组进行连接操作，每次调用Next()方法其向父节点返回一个符合连接谓词的连接元组：
 
 ```
-NestedLoopJoinExecutor::NestedLoopJoinExecutor(ExecutorContext *exec_ctx, const NestedLoopJoinPlanNode *plan,
-                                               std::unique_ptr<AbstractExecutor> &&left_executor,
-                                               std::unique_ptr<AbstractExecutor> &&right_executor)
+NestedLoopJoinExecutor::NestedLoopJoinExecutor(
+      ExecutorContext *exec_ctx,                            // 执行上下文
+      const NestedLoopJoinPlanNode *plan,                   // 连接计划节点
+      std::unique_ptr<AbstractExecutor> &&left_executor,    // 左表执行器，处理左表数据
+      std::unique_ptr<AbstractExecutor> &&right_executor)   // 右表执行器，处理右表数据
     : AbstractExecutor(exec_ctx),
       plan_(plan),
       left_executor_(left_executor.release()),
       right_executor_(right_executor.release()) {}
 
+
+
 void NestedLoopJoinExecutor::Init() {
-  left_executor_->Init();
-  right_executor_->Init();
-  buffer_.clear();
+  left_executor_->Init();                    // 初始化左表执行器，处理左表数据
+  right_executor_->Init();                   // 初始化右表执行器，处理右表数据
+  buffer_.clear();                           // 清空结果缓存
+
   const Schema *left_schema = plan_->GetLeftPlan()->OutputSchema();
   const Schema *right_schema = plan_->GetRightPlan()->OutputSchema();
   const Schema *out_schema = this->GetOutputSchema();
+  //获取左表模式、右表模式和输出模式
+
   Tuple left_tuple;
   Tuple right_tuple;
   RID rid;
+
   while (left_executor_->Next(&left_tuple, &rid)) {
+  //外层循环：遍历左表所有元组
     right_executor_->Init();
+    //每获取一个左表元组，重新初始化右表执行器
     while (right_executor_->Next(&right_tuple, &rid)) {
+    //内层循环：遍历右表所有元组
       auto *predicate = plan_->Predicate();
-      if (predicate == nullptr ||
-          predicate->EvaluateJoin(&left_tuple, left_schema, &right_tuple, right_schema).GetAs<bool>()) {
-        std::vector<Value> values;
+      if (predicate == nullptr || predicate->EvaluateJoin(&left_tuple, left_schema, &right_tuple, right_schema).GetAs<bool>()) {
+    //评估连接谓词条件（如果有的话）（如 a.id = b.id）
+        std::vector<Value> values;//根据输出模式构建新的值数组
         for (const auto &col : out_schema->GetColumns()) {
           values.emplace_back(col.GetExpr()->EvaluateJoin(&left_tuple, left_schema, &right_tuple, right_schema));
+          //对输出模式中的每一列，使用EvaluateJoin方法计算表达式的值
         }
         buffer_.emplace_back(values, out_schema);
+        //将构建的新元组添加到结果缓冲区
+        //结果不是立即返回，而是存入缓冲区以便后续检索
       }
     }
   }
@@ -2677,15 +2691,31 @@ void NestedLoopJoinExecutor::Init() {
 
 ```
 bool NestedLoopJoinExecutor::Next(Tuple *tuple, RID *rid) {
-  if (!buffer_.empty()) {
-    *tuple = buffer_.back();
+  if (!buffer_.empty()) {           //检查结果缓冲区是否为空
+    *tuple = buffer_.back();        //如果有结果，则取出最后一个元组（以栈的方式处理）
     buffer_.pop_back();
-    return true;
+    return true;                    //从缓冲区中移除该元组并返回true表示成功
   }
-  return false;
+  return false;                     //如果缓冲区为空，返回false表示连接结果已全部返回
 }
 ```
 
 在Next()中，仅需提取缓冲区内的元组即可。
 
+**典型执行示例**
+
+SQL 查询
+```
+SELECT a.name, b.value 
+FROM table_a a JOIN table_b b 
+ON a.id = b.id
+```
+- 执行过程
+  - 遍历 table_a 的每条记录
+  - 对每条 table_a 记录：
+    - 全扫描 table_b
+    - 检查 a.id = b.id
+    - 匹配则组合 (a.name, b.value)
+  - 缓存所有匹配结果
+  - 逐个返回结果
 
