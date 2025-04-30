@@ -3567,4 +3567,11 @@ DistinctKey{
     → filter.Next()
       → seq_scan.Next()
     ```
-    
+
+## Project 4 : CONCURRENCY CONTROL
+
+本实验将实现bustub中的锁管理器，其负责跟踪数据库中使用的元组级锁，以使得数据库支持并发的查询计划执行。
+
+### TASK 1 - LOCK MANAGER + DEADLOCK PREVENTION
+
+在本实验中，将使用两阶段锁策略实现具体的元组级锁，具体的锁定解锁策略应当由事务的隔离级别决定。当一个事务需要读取或写入元组时，其需要根据隔离级别尝试获得元组对应的读锁或写锁，并在适当的时刻将其释放。
