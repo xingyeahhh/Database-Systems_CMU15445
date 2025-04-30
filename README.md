@@ -3351,25 +3351,61 @@ if (hash_table_[key].sum_salary / hash_table_[key].count > 5000) {
 LimitExecutor用于限制输出元组的数量，其计划节点中定义了具体的限制数量。其Init()应当调用子计划节点的Init()方法，并重置当前限制数量；Next()方法则将子计划节点的元组返回，直至限制数量为0。
 
 ```
-LimitExecutor::LimitExecutor(ExecutorContext *exec_ctx, const LimitPlanNode *plan,
-                             std::unique_ptr<AbstractExecutor> &&child_executor)
-    : AbstractExecutor(exec_ctx), plan_(plan), child_executor_(child_executor.release()) {
-  limit_ = plan_->GetLimit();
+private:
+  const LimitPlanNode *plan_;          // 计划节点（包含LIMIT数量）
+  std::unique_ptr<AbstractExecutor> child_executor_;  // 子执行器
+  size_t limit_;
+
+
+LimitExecutor::LimitExecutor(
+      ExecutorContext *exec_ctx,
+      const LimitPlanNode *plan,
+      std::unique_ptr<AbstractExecutor> &&child_executor)
+    : AbstractExecutor(exec_ctx),
+      plan_(plan),
+      child_executor_(child_executor.release()) {
+  limit_ = plan_->GetLimit();  // 初始化限额
 }
 
+//从计划节点获取初始的LIMIT值（如 LIMIT 10 中的10）
+//接管子执行器的所有权
+
 void LimitExecutor::Init() {
-  child_executor_->Init();
-  limit_ = plan_->GetLimit();
+  child_executor_->Init();       // 初始化子执行器
+  limit_ = plan_->GetLimit();    // 重置限额计数器
 }
 
 bool LimitExecutor::Next(Tuple *tuple, RID *rid) {
+  // 检查限额和子执行器状态
   if (limit_ == 0 || !child_executor_->Next(tuple, rid)) {
     return false;
   }
+  // 更新限额并返回成功
   --limit_;
   return true;
 }
+
+//双重检查：
+//limit_ == 0：已达到限制数量
+//!child_executor_->Next(...)：子执行器无更多数据
+//状态更新：
+//每次成功返回后递减 limit_
+//保证不会超额返回
+
+示例场景：
+查询：SELECT * FROM students LIMIT 3
+
+执行过程：
+第一次Next(): limit_=3 → 返回第1条，limit_=2
+
+第二次Next(): limit_=2 → 返回第2条，limit_=1
+
+第三次Next(): limit_=1 → 返回第3条，limit_=0
+
+第四次Next(): limit_=0 → 直接返回false
 ```
+
+
 
 ### DistinctExecutor
 
@@ -3377,12 +3413,14 @@ DistinctExecutor用于去除相同的输入元组，并将不同的元组输出�
 
 ```
 namespace bustub {
+
 struct DistinctKey {
-  std::vector<Value> value_;
+  std::vector<Value> value_;      // 存储元组所有列的值
+
   bool operator==(const DistinctKey &other) const {
     for (uint32_t i = 0; i < other.value_.size(); i++) {
       if (value_[i].CompareEquals(other.value_[i]) != CmpBool::CmpTrue) {
-        return false;
+        return false;             // 任意一列不相等则整个key不相等
       }
     }
     return true;
@@ -3392,7 +3430,7 @@ struct DistinctKey {
 }  // namespace bustub
 
 namespace std {
-
+//哈希特化
 /** Implements std::hash on AggregateKey */
 template <>
 struct hash<bustub::DistinctKey> {
@@ -3406,6 +3444,11 @@ struct hash<bustub::DistinctKey> {
     return curr_hash;
   }
 };
+作用：为整个元组生成唯一标识
+逐列哈希：每列值单独计算哈希
+哈希组合：使用CombineHashes合并各列哈希值，组合所有列的哈希值
+NULL处理：跳过NULL值的哈希计算
+
 ...
 
 class DistinctExecutor : public AbstractExecutor {
@@ -3415,10 +3458,11 @@ class DistinctExecutor : public AbstractExecutor {
   DistinctKey MakeKey(const Tuple *tuple) {
     std::vector<Value> values;
     const Schema *schema = GetOutputSchema();
+    // 提取元组所有列值
     for (uint32_t i = 0; i < schema->GetColumnCount(); ++i) {
       values.emplace_back(tuple->GetValue(schema, i));
     }
-    return {values};
+    return {values};// 构造DistinctKey
   }
 };
 ```
@@ -3426,23 +3470,99 @@ class DistinctExecutor : public AbstractExecutor {
 在实际运行中，使用哈希表去重即。Init()清空当前哈希表，并初始化子计划节点。Next()判断当前元组是否已经出现在哈希表中，如是则遍历下一个输入元组，如非则将该元组插入哈希表并返回：
 
 ```
-DistinctExecutor::DistinctExecutor(ExecutorContext *exec_ctx, const DistinctPlanNode *plan,
-                                   std::unique_ptr<AbstractExecutor> &&child_executor)
-    : AbstractExecutor(exec_ctx), plan_(plan), child_executor_(child_executor.release()) {}
+DistinctExecutor::DistinctExecutor(
+      ExecutorContext *exec_ctx,
+      const DistinctPlanNode *plan,
+      std::unique_ptr<AbstractExecutor> &&child_executor)
+    : AbstractExecutor(exec_ctx),
+      plan_(plan),
+      child_executor_(child_executor.release()) {}
 
 void DistinctExecutor::Init() {
-  set_.clear();
-  child_executor_->Init();
+  set_.clear();                // 清空哈希表
+  child_executor_->Init();     // 初始化数据源
 }
+//可重复执行：每次查询重置状态
+//惰性初始化：不预先加载数据
 
 bool DistinctExecutor::Next(Tuple *tuple, RID *rid) {
   while (child_executor_->Next(tuple, rid)) {
-    auto key = MakeKey(tuple);
-    if (set_.count(key) == 0U) {
-      set_.insert(key);
-      return true;
+    auto key = MakeKey(tuple);      // 构造DistinctKey
+
+    if (set_.count(key) == 0U) {    // 检查是否已存在
+      set_.insert(key);             // 插入新键
+      return true;                  // 返回唯一元组
     }
+// 重复元组则继续循环
   }
-  return false;
+  return false; // 数据源耗尽
 }
+
+示例:
+SELECT DISTINCT dept, title FROM employees
+
+输入元组：
+(IT, Engineer)
+(HR, Manager)
+(IT, Engineer)  ← 重复
+(IT, Designer)
+
+处理过程：
+插入 (IT, Engineer) → 新键
+插入 (HR, Manager) → 新键
+跳过 (IT, Engineer) → 已存在
+插入 (IT, Designer) → 新键
+
+输出结果：
+(IT, Engineer)
+(HR, Manager) 
+(IT, Designer)
+
+案例1：SELECT DISTINCT name, dept
+DistinctKey{
+  values: [name_value, dept_value]  // 两列组合
+}
+
+("Alice", "IT")：
+Hash("Alice") = 0x1234
+Hash("IT") = 0x5678
+Combined = CombineHashes(0x1234, 0x5678) → 0xABCD
+
+("Bob", "HR")：
+Hash("Bob") = 0x2345
+Hash("HR") = 0x6789
+Combined = CombineHashes(0x2345, 0x6789) → 0xBCDE
+
+("Alice", "Sales")：
+Hash("Alice") = 0x1234 (与之前相同)
+Hash("Sales") = 0x9ABC
+Combined = CombineHashes(0x1234, 0x9ABC) → 0xEF01
+
+(NULL, "IT")：
+NULL → 跳过
+Hash("IT") = 0x5678
+Combined = 0x5678 (仅dept的哈希)
+
+案例2：SELECT DISTINCT salary
+DistinctKey{
+  values: [salary_value]  // 单列
+}
+
+哈希过程：
+5000 → Hash(5000) = 0x1111
+4000 → Hash(4000) = 0x2222
 ```
+- while (child_executor_->Next(tuple, rid)) 不算recursion,因为调用其他对象的成员函数，固定栈深度，通过循环条件停止，流式数据处理
+
+**child_executor_ 的典型类型**
+- 根据查询计划的不同，child_executor_ 可能是SeqScanExecutor, InsertExecutor,UpdateExecutor与DeleteExecutor等等
+- 示例查询
+  - SELECT DISTINCT dept FROM employees WHERE salary > 10000 ORDER BY dept
+    ```
+    自底向上创建
+    distinct.Next()
+  → sort.Next()
+    → filter.Next()
+      → seq_scan.Next()
+    ```
+    
