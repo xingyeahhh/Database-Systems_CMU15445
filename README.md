@@ -3462,7 +3462,7 @@ class DistinctExecutor : public AbstractExecutor {
     for (uint32_t i = 0; i < schema->GetColumnCount(); ++i) {
       values.emplace_back(tuple->GetValue(schema, i));
     }
-    return {values};// 构造DistinctKey
+    return {values};// 构造DistinctKey，这里确实只是将各列的值收集到vector中，尚未计算哈希。
   }
 };
 ```
@@ -3489,6 +3489,8 @@ bool DistinctExecutor::Next(Tuple *tuple, RID *rid) {
   while (child_executor_->Next(tuple, rid)) {
     auto key = MakeKey(tuple);      // 构造DistinctKey
 
+//实际哈希计算阶段（隐藏在STL中）
+//当 set_.insert(key) 或 set_.count(key) 被调用时：
     if (set_.count(key) == 0U) {    // 检查是否已存在
       set_.insert(key);             // 插入新键
       return true;                  // 返回唯一元组
