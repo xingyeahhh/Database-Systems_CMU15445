@@ -3560,13 +3560,14 @@ DistinctKey{
 - 根据查询计划的不同，child_executor_ 可能是SeqScanExecutor, InsertExecutor,UpdateExecutor与DeleteExecutor等等
 - 示例查询
   - SELECT DISTINCT dept FROM employees WHERE salary > 10000 ORDER BY dept
-    ```
+
+```
     自底向上创建
     distinct.Next()
   → sort.Next()
     → filter.Next()
       → seq_scan.Next()
-    ```
+```
 
 ## Project 4 : CONCURRENCY CONTROL
 
