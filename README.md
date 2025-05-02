@@ -3576,3 +3576,39 @@ DistinctKey{
 ### TASK 1 - LOCK MANAGER + DEADLOCK PREVENTION
 
 在本实验中，将使用两阶段锁策略实现具体的元组级锁，具体的锁定解锁策略应当由事务的隔离级别决定。当一个事务需要读取或写入元组时，其需要根据隔离级别尝试获得元组对应的读锁或写锁，并在适当的时刻将其释放。
+
+
+**事务及隔离级别**
+
+```
+155 class Transaction {
+...
+257  private:
+258   /** The current transaction state. */
+259   TransactionState state_;
+260   /** The isolation level of the transaction. */
+261   IsolationLevel isolation_level_;
+262   /** The thread ID, used in single-threaded transactions. */
+263   std::thread::id thread_id_;
+264   /** The ID of this transaction. */
+265   txn_id_t txn_id_;
+266 
+267   /** The undo set of table tuples. */
+268   std::shared_ptr<std::deque<TableWriteRecord>> table_write_set_;
+269   /** The undo set of indexes. */
+270   std::shared_ptr<std::deque<IndexWriteRecord>> index_write_set_;
+271   /** The LSN of the last record written by the transaction. */
+272   lsn_t prev_lsn_;
+273 
+274   /** Concurrent index: the pages that were latched during index operation. */
+275   std::shared_ptr<std::deque<Page *>> page_set_;
+276   /** Concurrent index: the page IDs that were deleted during index operation.*/
+277   std::shared_ptr<std::unordered_set<page_id_t>> deleted_page_set_;
+278 
+279   /** LockManager: the set of shared-locked tuples held by this transaction. */
+280   std::shared_ptr<std::unordered_set<RID>> shared_lock_set_;
+281   /** LockManager: the set of exclusive-locked tuples held by this transaction. */
+282   std::shared_ptr<std::unordered_set<RID>> exclusive_lock_set_;
+283 };
+284 
+```
