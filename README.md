@@ -4206,6 +4206,18 @@ READ_COMMITTED 不严格2PL：
 
 需要注意，当事务隔离级别为READ_COMMIT时，事务获得的读锁将在使用完毕后立即释放，因此该类事务不符合2PL规则，为了程序的兼容性，在这里认为READ_COMMIT事务在COMMIT或ABORT之前始终保持GROWING状态，对于其他事务，将在调用Unlock时转变为SHRINKING状态。在释放锁时，遍历锁请求对列并删除对应事务的锁请求，然后唤醒其他事务，并在事务的锁集合中删除该锁。
 
+![image](https://github.com/user-attachments/assets/bba61407-cd10-4918-bac3-3d3fe1073fbc)
+
+两阶段锁协议（2PL）的核心规则
+ - 在严格2PL下（如 REPEATABLE_READ / SERIALIZABLE）：
+ - GROWING 阶段（扩展阶段）：事务只能 获取锁，不能释放锁。
+ - SHRINKING 阶段（收缩阶段）：事务只能 释放锁，不能获取新锁。
+
+关键点：
+ - 事务一旦开始释放锁（即第一次调用 Unlock），就进入 SHRINKING 阶段。
+ - 之后该事务 不能再获取任何新锁，但 可以继续执行其他操作（如读已锁定数据、计算等）
+
+
 ### TASK3 - CONCURRENT QUERY EXECUTION
 
 在本部分中，需要为查询计划执行器的顺序扫描、插入、删除、更新计划的NEXT()方法提供元组锁的保护，使得上述计划可支持并发执行。
@@ -4305,3 +4317,36 @@ READ_COMMITTED 不严格2PL：
 
 对于InsertExecutor，其在将元组插入表后获得插入表的写锁。需要注意，当其元组来源为其他计划节点时，其来源元组与插入表的元组不是同一个元组。
 
+```
+ 30 bool DeleteExecutor::Next([[maybe_unused]] Tuple *tuple, RID *rid) {
+ 31   auto exec_ctx = GetExecutorContext();
+ 32   Transaction *txn = exec_ctx_->GetTransaction();
+ 33   TransactionManager *txn_mgr = exec_ctx->GetTransactionManager();
+ 34   LockManager *lock_mgr = exec_ctx->GetLockManager();
+ 35 
+ 36   while (child_executor_->Next(tuple, rid)) {
+ 37     if (txn->GetIsolationLevel() != IsolationLevel::REPEATABLE_READ) {
+ 38       if (!lock_mgr->LockExclusive(txn, *rid)) {
+ 39         txn_mgr->Abort(txn);
+ 40       }
+ 41     } else {
+ 42       if (!lock_mgr->LockUpgrade(txn, *rid)) {
+ 43         txn_mgr->Abort(txn);
+ 44       }
+ 45     }
+ 46     if (table_info_->table_->MarkDelete(*rid, txn)) {
+ 47       for (auto indexinfo : indexes_) {
+ 48         indexinfo->index_->DeleteEntry(tuple->KeyFromTuple(*child_executor_->GetOutputSchema(), i    ndexinfo->key_schema_,
+ 49                                                            indexinfo->index_->GetKeyAttrs()),
+ 50                                        *rid, txn);
+ 51         IndexWriteRecord iwr(*rid, table_info_->oid_, WType::DELETE, *tuple, *tuple, indexinfo->i    ndex_oid_,
+ 52                              exec_ctx->GetCatalog());
+ 53         txn->AppendIndexWriteRecord(iwr);
+ 54       }
+ 55     }
+ 56   }
+ 57   return false;
+ 58 }
+```
+
+对于DeleteExecutor和UpdateExecutor，在其获得子计划节点元组后，应当为该元组加读锁。需要注意的是，当事务隔离等级为REPEATABLE_READ时，其子计划节点拥有该元组的读锁，因此此时应该调用LockUpgrade升级锁，而不是获得新写锁。
