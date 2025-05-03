@@ -3580,6 +3580,7 @@ DistinctKey{
 
 **事务及隔离级别**
 
+#### Transaction
 ```
 155 class Transaction {
 ...
@@ -3668,6 +3669,8 @@ TransactionManager中进行事务的实际行为，如BEGIN、COMMIT、ABORT，�
 
 在锁管理器中，使用lock table管理锁，lock table是以元组ID为键，锁请求队列为值的哈希表。其中，锁请求中保存了请求该元组锁的事务ID、请求的元组锁类型、以及请求是否被许可；通过队列的方式保存锁保证了锁请求的先后顺序：
 
+#### LockRequest & LockRequestQueue
+
 ```
  38   class LockRequest {
  39    public:
@@ -3690,7 +3693,7 @@ TransactionManager中进行事务的实际行为，如BEGIN、COMMIT、ABORT，�
  55   };
 ```
 
-### LockShared
+#### LockShared
 
 在LockShared中，事务txn请求元组ID为rid的读锁：
 
@@ -3909,4 +3912,180 @@ T3的视角：
 
 2. 队列中在该事务之前的锁请求是否存在活写锁（状态不为ABORT），如是则继续阻塞，如非则将该请求的granted_置为真，并返回。
 
+#### LockExclusive
 
+LockExclusive使得事务txn尝试获得元组ID为rid的元组写锁。
+
+```
+将指定事务对特定资源的排他锁请求加入到锁管理队列中
+
+ 83 auto LockManager::LockExclusive(Transaction *txn, const RID &rid) -> bool {
+
+auto ... -> bool：这是C++11引入的尾置返回类型语法，表示函数返回bool类型
+等价于传统写法：bool LockManager::LockExclusive(...)
+现代C++更推荐这种写法，特别是返回类型较复杂时更清晰
+LockManager::：表示这是LockManager类的成员函数
+参数部分：
+Transaction *txn：指向Transaction对象的指针，表示要加锁的事务
+const RID &rid：常量引用，表示要加锁的资源标识符(Record ID)
+
+这个函数的核心功能确实是：将指定事务对特定资源的排他锁请求加入到锁管理队列中，但它的完整工作流程更复杂：
+参数处理：
+接收一个事务指针(txn)和资源ID(rid)
+rid使用const引用避免拷贝，提高效率
+
+锁管理流程：
+检查事务状态是否允许加锁
+将锁请求加入对应资源的等待队列
+实现Wound-Wait死锁预防策略
+处理锁授予或等待逻辑
+
+返回值：
+返回bool表示是否成功获得锁
+实际上在内部通过异常处理错误情况
+
+ 84   if (txn->GetState() == TransactionState::ABORTED) {
+ 85     return false;
+ 86   }
+ 87   if (txn->GetState() == TransactionState::SHRINKING) {
+ 88     txn->SetState(TransactionState::ABORTED);
+ 89     throw TransactionAbortException(txn->GetTransactionId(), AbortReason::LOCK_ON_SHRINKING);
+ 90   }
+
+ABORTED检查：如果事务已经中止，直接返回false
+SHRINKING阶段检查：根据两阶段锁协议，在收缩阶段不能获取新锁，违反则中止事务
+```
+83-90行：进行前置检查，如当前事务状态为ABORT返回假，如当前锁在收缩阶段，则将其状态置为ABORT并抛出异常。
+
+```
+ 91   txn->SetState(TransactionState::GROWING);       //设置事务状态为GROWING阶段
+ 92   std::unique_lock<std::mutex> lk(latch_);        //获取锁表互斥锁
+ 93   auto &lock_request_queue = lock_table_[rid];    //获取或创建该RID的锁请求队列
+ 94   auto &request_queue = lock_request_queue.request_queue_;   
+ 95   auto &cv = lock_request_queue.cv_;
+ 96   auto txn_id = txn->GetTransactionId();
+ 97   request_queue.emplace_back(txn_id, LockMode::EXCLUSIVE); //创建新的排他锁请求并加入队列
+ 98   txn->GetExclusiveLockSet()->emplace(rid);
+ 99   txn_table_[txn_id] = txn;                  //记录事务持有的锁,更新事务表
+
+
+100   //Wound Wait
+101   bool can_grant = true;
+102   bool is_kill = false;
+103   for (auto &request : request_queue) {
+104     if (request.txn_id_ == txn_id) {
+105       request.granted_ = can_grant;
+106       break;
+107     }
+108     if (request.txn_id_ > txn_id) {
+109       txn_table_[request.txn_id_]->SetState(TransactionState::ABORTED);
+110       is_kill = true;
+111     } else {
+112       can_grant = false;
+113     }
+114   }
+115   if (is_kill) {
+116     cv.notify_all();
+117   }
+Wound-Wait策略：
+当前事务(txn_id)遇到更年轻的事务(更大txn_id)时，会终止它们
+遇到更年长的事务(更小txn_id)时，必须等待
+如果终止了其他事务，通知所有等待线程
+```
+
+91-117行：更新事务状态，获取锁请求队列，并将该请求插入队列，以及将该锁加入事务的拥有锁集合。查询是否有将该事务锁请求阻塞的请求，当获取写锁时，队列中的任何一个锁请求都将造成其阻塞，当锁请求的事务优先级低时，将其杀死。如存在不能杀死的请求，则该事务将被阻塞。当杀死了任一事务时，将唤醒该锁等待队列的所有事务。
+
+```
+      // 循环等待直到锁被授予
+119   while (!can_grant) {
+120     auto it = request_queue.begin();
+121     while (txn_table_[it->txn_id_]->GetState() == TransactionState::ABORTED) {
+122       ++it;      //跳过已中止的事务请求
+123     }//就是剔除确保前面所有的排他锁都没了
+124     if (it->txn_id_ == txn_id) {
+125       can_grant = true;
+126       it->granted_ = true;
+127     }
+128     if (!can_grant) {
+129       cv.wait(lk);   //否则通过条件变量等待
+130     }
+131     if (txn->GetState() == TransactionState::ABORTED) {
+132       throw TransactionAbortException(txn->GetTransactionId(), AbortReason::DEADLOCK);
+133     }                //如果事务被中止(如死锁检测)，抛出异常
+134   }
+135   return true;
+136 }
+```
+ - 与LockShared的区别
+   - 排他锁与所有锁都不兼容，而共享锁与共享锁兼容
+   - 锁授予条件更严格，必须等待所有前面的锁释放
+   - 对事务状态的影响更大(排他锁会阻塞更多事务)
+     
+91-117行：等待锁可用，每当事务被唤醒时，检查其是否被杀死，如被杀死则抛出异常；如未被杀死，则检查队列前是否有任意未被杀死的锁请求，如没有则获得锁并将锁请求granted_置为真。
+
+
+#### LockUpgrade
+LockUpgrade用于将当前事务txn所拥有的元组ID为rid的读锁升级为写锁。
+
+```
+138 auto LockManager::LockUpgrade(Transaction *txn, const RID &rid) -> bool {
+139   if (txn->GetState() == TransactionState::ABORTED) {
+140     return false;
+141   }
+142   std::unique_lock<std::mutex> lk(latch_);
+143   auto &lock_request_queue = lock_table_[rid];
+144   if (lock_request_queue.upgrading_ != INVALID_TXN_ID) {
+145     txn->SetState(TransactionState::ABORTED);
+146     throw TransactionAbortException(txn->GetTransactionId(), AbortReason::UPGRADE_CONFLICT);
+147   }
+148   auto &request_queue = lock_request_queue.request_queue_;
+149   auto &cv = lock_request_queue.cv_;
+150   auto txn_id = txn->GetTransactionId();
+151   lock_request_queue.upgrading_ = txn_id;
+```
+
+138-151行：判断当前事务是否被杀死，以及该元组的锁请求序列是否已经存在等待升级锁的其他事务，如是则杀死事务并抛出异常。如通过检验，则将当前锁请求队列的upgrading_置为当前事务ID，以提示该队列存在一个等待升级锁的事务。
+
+
+```
+153   while (!can_grant) {
+154     auto it = request_queue.begin();
+155     auto target = it;
+156     can_grant = true;
+157     bool is_kill = false;
+158     while (it != request_queue.end() && it->granted_) {
+159       if (it->txn_id_ == txn_id) {
+160         target = it;
+161       } else if (it->txn_id_ > txn_id) {
+162         txn_table_[it->txn_id_]->SetState(TransactionState::ABORTED);
+163         is_kill = true;
+164       } else {
+165         can_grant = false;
+166       }
+167       ++it;
+168     }
+169     if (is_kill) {
+170       cv.notify_all();
+171     } 
+172     if (!can_grant) {
+173       cv.wait(lk);
+174     } else {
+175       target->lock_mode_ = LockMode::EXCLUSIVE;
+176       lock_request_queue.upgrading_ = INVALID_TXN_ID;
+177     } 
+178     if (txn->GetState() == TransactionState::ABORTED) {
+179       throw TransactionAbortException(txn->GetTransactionId(), AbortReason::DEADLOCK);
+180     } 
+181   } 
+182   
+183   txn->GetSharedLockSet()->erase(rid);
+184   txn->GetExclusiveLockSet()->emplace(rid);
+185   return true;
+
+```
+
+152-184行：在Wound Wait中并未提及有关更新锁的行为，在这里将其每次唤醒尝试升级锁视为一次写锁获取，即每次其尝试升级锁时都将杀死队列前方将其阻塞的事务。
+
+其具体方法为，每次事务被唤醒时，先检查其是否被杀死，然后遍历锁请求队列在其前方的请求，如其优先级较低则将其杀死，如其优先级较高则将can_grant置为假，示意其将在之后被阻塞。如杀死任意一个事务，则唤醒其他事务。如can_grant为假则阻塞事务，如为真则更新锁请求的lock_mode_并将upgrading_初始化。
+
+当升级成功时，更新事务的拥有锁集合。
