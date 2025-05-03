@@ -3723,7 +3723,7 @@ TransactionManager中进行事务的实际行为，如BEGIN、COMMIT、ABORT，�
  32   txn->SetState(TransactionState::GROWING);
 
 //通过 latch_ 保护 lock_table_（全局锁表）的线程安全，防止并发修改冲突。
-//latch_	 --> std::mutex	被锁的互斥量（通常是成员变量）
+//latch_	--> std::mutex	被锁的互斥量（通常是成员变量）
 //lk	--> std::unique_lock	负责管理锁的生命周期
 //创建一个 std::unique_lock 对象 lk，并立刻尝试锁住 latch_。
  33   std::unique_lock<std::mutex> lk(latch_);
@@ -3816,24 +3816,67 @@ Wait-Die：低优先级事务主动等待（不终止）。
 
 ```
  61   //Wait the lock
- 62   while (!can_grant) {
+ 62   while (!can_grant) {         //进入循环等待状态，直到满足授予条件。
  63     for (auto &request : request_queue) {
+
+          // 如果队列中存在未中止的排他锁（X锁），则当前事务必须继续等待
  64       if (request.lock_mode_ == LockMode::EXCLUSIVE &&
  65           txn_table_[request.txn_id_]->GetState() != TransactionState::ABORTED) {
- 66         break;
+ 66         break;       // 直接退出循环，保持 can_grant = false
  67       }
+
+          // 找到当前事务的请求，尝试授予锁
  68       if (request.txn_id_ == txn_id) {
- 69         can_grant = true;
- 70         request.granted_ = true;
+ 69         can_grant = true;               // 标记为可授予
+ 70         request.granted_ = true;        // 更新请求状态
  71       }
  72     }
+
+冲突检测：
+如果队列中存在 活跃的排他锁（X锁）（即持有者事务未中止），当前事务必须等待（can_grant 保持 false）。
+如果没有冲突的X锁，当前事务的共享锁请求会被授予（can_grant = true）。
+重点：只有队列中 没有未中止的X锁 时，共享锁才能被授予。
+
  73     if (!can_grant) {
- 74       cv.wait(lk);
+ 74       cv.wait(lk);    // 释放锁并阻塞，等待唤醒
  75     }
+
+如果锁仍不可授予（can_grant == false），当前线程通过 cv.wait(lk) 释放互斥锁 lk 并进入阻塞状态。
+唤醒条件：
+其他事务释放锁时调用 cv.notify_all()。
+被死锁检测机制强制中止（见下文）。
+
  76     if (txn->GetState() == TransactionState::ABORTED) {
  77       throw TransactionAbortException(txn->GetTransactionId(), AbortReason::DEADLOCK);
  78     }
+如果事务被标记为 ABORTED（例如被死锁检测机制终止），直接抛出异常，通知调用方事务因死锁失败。
+如果事务在等待期间被外部死锁检测机制标记为 ABORTED，立即抛出异常。
+AbortReason::DEADLOCK 明确指示失败原因是死锁。
  79   }
  80   return true;
+当 can_grant 变为 true 时，退出循环，锁请求成功。
  81 }
 ```
+
+条件变量（cv）的作用
+高效等待：通过 cv.wait(lk) 避免忙等待（Busy Waiting），减少CPU占用。
+线程安全：在 wait 期间会临时释放 lk，允许其他线程修改队列；被唤醒后自动重新获取锁。
+
+ **示例场景**
+ 
+假设事务T1（txn_id=1）和T2（txn_id=2）并发访问同一数据项：
+
+ - T1 持有X锁：
+   - T2 请求S锁时，发现T1的X锁未释放，进入 while (!can_grant) 循环。
+   - T2 调用 cv.wait(lk) 阻塞。
+ - T1 释放X锁：
+   - T1 调用 Unlock，触发 cv.notify_all() 唤醒T2。
+   - T2 重新检查队列，发现无冲突X锁，授予S锁。
+ - 死锁情况：
+   - 如果T2等待期间，系统检测到死锁（如T1在等T2持有的另一把锁），T2会被标记为 ABORTED，并抛出异常。
+  
+61-81行：如存在阻塞该事务的其他事务，且该事务不能将其杀死，则进入循环等待锁。在循环中，事务调用条件变量cv的wait阻塞自身，并原子地释放锁。每次当其被唤醒时，其检查：
+
+该事务是否被杀死，如是则抛出异常；
+
+队列中在该事务之前的锁请求是否存在活写锁（状态不为ABORT），如是则继续阻塞，如非则将该请求的granted_置为真，并返回。
