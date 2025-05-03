@@ -3698,6 +3698,8 @@ TransactionManager中进行事务的实际行为，如BEGIN、COMMIT、ABORT，�
 在LockShared中，事务txn请求元组ID为rid的读锁：
 
 ```
+LockManager::LockShared 函数负责为指定事务在特定记录上获取共享锁。共享锁允许多个事务同时读取同一资源，但阻止其他事务获取排他锁来修改该资源。这是实现数据库隔离级别的基本机制之一。
+
  20 auto LockManager::LockShared(Transaction *txn, const RID &rid) -> bool {
  21   if (txn->GetState() == TransactionState::ABORTED) {
  22     return false;
@@ -3917,7 +3919,8 @@ T3的视角：
 LockExclusive使得事务txn尝试获得元组ID为rid的元组写锁。
 
 ```
-将指定事务对特定资源的排他锁请求加入到锁管理队列中
+LockManager::LockExclusive 函数的目的是为指定事务在特定记录（由RID标识）上获取排他锁（写锁）。排他锁允许事务独占资源，防止其他事务同时读或写该资源。这对于保证数据库事务的隔离性和一致性非常重要。
+The purpose of the LockManager::LockExclusive function is to acquire an exclusive lock (write lock) for a specified transaction on a particular record (identified by RID). An exclusive lock allows a transaction to have sole access to a resource, preventing other transactions from simultaneously reading or writing to that resource. This is crucial for ensuring isolation and consistency of database transactions.
 
  83 auto LockManager::LockExclusive(Transaction *txn, const RID &rid) -> bool {
 
@@ -4028,60 +4031,120 @@ Wound-Wait策略：
 LockUpgrade用于将当前事务txn所拥有的元组ID为rid的读锁升级为写锁。
 
 ```
+//LockUpgrade 负责将事务对某个资源（RID）的 共享锁升级为排他锁。其核心挑战是：
+//必须保证升级操作的 原子性（避免与其他事务的锁请求冲突）
+//处理潜在的 死锁风险（如多个事务同时尝试升级）
+//遵循 两阶段锁协议（2PL）
+
 138 auto LockManager::LockUpgrade(Transaction *txn, const RID &rid) -> bool {
 139   if (txn->GetState() == TransactionState::ABORTED) {
 140     return false;
 141   }
+目的：如果事务已被中止，直接返回失败。
+为什么重要：确保不会对已失效的事务进行操作。
+
 142   std::unique_lock<std::mutex> lk(latch_);
+作用：通过互斥锁 latch_ 保护锁表操作，保证线程安全。
+关键点：使用 unique_lock 而非 lock_guard，因为后续可能需要配合条件变量解锁。
+
 143   auto &lock_request_queue = lock_table_[rid];
 144   if (lock_request_queue.upgrading_ != INVALID_TXN_ID) {
 145     txn->SetState(TransactionState::ABORTED);
 146     throw TransactionAbortException(txn->GetTransactionId(), AbortReason::UPGRADE_CONFLICT);
 147   }
+设计意图：
+upgrading_ 字段标记当前是否有事务正在尝试升级。
+如果已有其他事务在升级（upgrading_ != INVALID_TXN_ID），立即中止当前事务。
+为什么需要：
+避免多个事务同时尝试升级同一资源，导致复杂死锁（如A等B，B等A）。
+
 148   auto &request_queue = lock_request_queue.request_queue_;
 149   auto &cv = lock_request_queue.cv_;
 150   auto txn_id = txn->GetTransactionId();
 151   lock_request_queue.upgrading_ = txn_id;
+作用：将当前事务ID写入 upgrading_ 字段，声明"我正在尝试升级"。
+后续影响：其他事务在此期间尝试升级会触发冲突检测（见行144-147）
 ```
 
 138-151行：判断当前事务是否被杀死，以及该元组的锁请求序列是否已经存在等待升级锁的其他事务，如是则杀死事务并抛出异常。如通过检验，则将当前锁请求队列的upgrading_置为当前事务ID，以提示该队列存在一个等待升级锁的事务。
 
 
 ```
+while循环目的：不断检查锁队列，直到当前事务可以安全升级（can_grant = true）。
+退出条件：
+所有比当前事务更早的锁请求都已释放（或已中止）。
+当前事务被授予排他锁（X锁）。
 153   while (!can_grant) {
 154     auto it = request_queue.begin();
-155     auto target = it;
-156     can_grant = true;
-157     bool is_kill = false;
+155     auto target = it;          // 记录当前事务的请求位置
+156     can_grant = true;          // 假设可以升级
+157     bool is_kill = false;      // 是否需要终止其他事务
 158     while (it != request_queue.end() && it->granted_) {
 159       if (it->txn_id_ == txn_id) {
-160         target = it;
+160         target = it;     // 找到当前事务的请求
 161       } else if (it->txn_id_ > txn_id) {
+            // Wound-Wait策略：终止更年轻的事务（txn_id更大）
 162         txn_table_[it->txn_id_]->SetState(TransactionState::ABORTED);
 163         is_kill = true;
 164       } else {
+            // 如果有更早的事务（txn_id更小），必须等待
 165         can_grant = false;
 166       }
 167       ++it;
 168     }
+it->granted_：只检查已授予的锁（未授予的锁不影响升级）。
+it->txn_id_ == txn_id：找到当前事务的锁请求（稍后修改为X锁）。
+it->txn_id_ > txn_id：Wound-Wait策略，终止更年轻的事务（避免死锁）。
+it->txn_id_ < txn_id：如果有更早的事务持有锁，必须等待（can_grant = false）。
+
 169     if (is_kill) {
-170       cv.notify_all();
-171     } 
+170       cv.notify_all(); // 唤醒所有等待的事务
+171     }
+作用：如果终止了其他事务（is_kill = true），通过 cv.notify_all() 唤醒所有等待线程，让被终止的事务清理资源。
+
 172     if (!can_grant) {
-173       cv.wait(lk);
+173       cv.wait(lk);   // 进入等待状态
 174     } else {
-175       target->lock_mode_ = LockMode::EXCLUSIVE;
-176       lock_request_queue.upgrading_ = INVALID_TXN_ID;
-177     } 
+175       target->lock_mode_ = LockMode::EXCLUSIVE;        // 升级为X锁
+176       lock_request_queue.upgrading_ = INVALID_TXN_ID;  // 清除升级标记
+177     }
+cv.wait(lk)：
+如果 can_grant = false（仍有更早的事务持有锁），当前事务进入等待状态。
+在等待期间，lk（互斥锁）会被释放，允许其他线程修改队列。
+当锁可用时（如前面的锁被释放），cv.notify_all() 会唤醒当前事务，重新检查条件。
+else 分支（升级成功）：
+将当前事务的锁模式改为 EXCLUSIVE（排他锁）。
+清除 upgrading_ 标记，允许其他事务尝试升级。
+
 178     if (txn->GetState() == TransactionState::ABORTED) {
 179       throw TransactionAbortException(txn->GetTransactionId(), AbortReason::DEADLOCK);
 180     } 
 181   } 
-182   
-183   txn->GetSharedLockSet()->erase(rid);
-184   txn->GetExclusiveLockSet()->emplace(rid);
-185   return true;
+182   作用：如果事务在等待期间被死锁检测机制标记为 ABORTED，抛出异常通知调用方。
 
+183   txn->GetSharedLockSet()->erase(rid);       // 移除S锁记录
+184   txn->GetExclusiveLockSet()->emplace(rid);  // 添加X锁记录
+185   return true;                               // 升级成功
+最终操作：
+从事务的 SharedLockSet 中移除该资源的S锁记录。
+在 ExclusiveLockSet 中添加X锁记录。
+返回 true 表示升级成功。
+
+示例场景
+假设：
+事务 T1（txn_id=1） 持有 S 锁。
+事务 T2（txn_id=2） 持有 S 锁。
+T1 尝试升级为 X 锁。
+
+执行流程：
+1.T1 设置 upgrading_ = 1，进入 while (!can_grant) 循环。
+2.检查队列：
+发现 T2（txn_id=2 > txn_id=1），触发 Wound-Wait，终止 T2。
+cv.notify_all() 唤醒 T2，T2 检测到 ABORTED 状态并清理。
+3.T1 再次检查队列：
+没有其他事务持有锁（T2 已终止），can_grant = true。
+4.T1 修改锁模式为 EXCLUSIVE，清除 upgrading_ 标记。
+5.从 SharedLockSet 移除 S 锁，在 ExclusiveLockSet 添加 X 锁。
 ```
 
 152-184行：在Wound Wait中并未提及有关更新锁的行为，在这里将其每次唤醒尝试升级锁视为一次写锁获取，即每次其尝试升级锁时都将杀死队列前方将其阻塞的事务。
@@ -4089,3 +4152,156 @@ LockUpgrade用于将当前事务txn所拥有的元组ID为rid的读锁升级为�
 其具体方法为，每次事务被唤醒时，先检查其是否被杀死，然后遍历锁请求队列在其前方的请求，如其优先级较低则将其杀死，如其优先级较高则将can_grant置为假，示意其将在之后被阻塞。如杀死任意一个事务，则唤醒其他事务。如can_grant为假则阻塞事务，如为真则更新锁请求的lock_mode_并将upgrading_初始化。
 
 当升级成功时，更新事务的拥有锁集合。
+
+#### Unlock
+
+Unlock函数使得事务txn释放元组ID为rid元组上的锁。
+
+```
+188 auto LockManager::Unlock(Transaction *txn, const RID &rid) -> bool {
+189   if (txn->GetState() == TransactionState::GROWING && txn->GetIsolationLevel() == IsolationLevel::REPEATABLE_READ) {
+190     txn->SetState(TransactionState::SHRINKING);
+191   }
+作用：
+如果事务处于 GROWING 阶段 且 隔离级别是 REPEATABLE_READ，则将其状态改为 SHRINKING（收缩阶段）。
+为什么？
+两阶段锁协议（2PL） 要求事务在释放第一个锁后进入 SHRINKING 阶段（不能再获取新锁）。
+
+但不同隔离级别的行为不同：
+READ_UNCOMMITTED / READ_COMMITTED：允许在释放锁后继续获取新锁（不严格遵循2PL）。
+REPEATABLE_READ / SERIALIZABLE：必须严格遵循2PL，因此首次解锁后进入 SHRINKING 阶段。
+192 
+193   std::unique_lock<std::mutex> lk(latch_); // 保护锁表
+194   auto &lock_request_queue = lock_table_[rid];
+195   auto &request_queue = lock_request_queue.request_queue_;
+196   auto &cv = lock_request_queue.cv_;
+197   auto txn_id = txn->GetTransactionId();
+// 找到当前事务的锁请求
+198   auto it = request_queue.begin();
+199   while (it->txn_id_ != txn_id) {
+200     ++it;
+201   }
+202 
+203   request_queue.erase(it);// 从队列中移除
+204   cv.notify_all();// 唤醒所有等待该锁的事务
+205   txn->GetSharedLockSet()->erase(rid);// 移除共享锁记录
+206   txn->GetExclusiveLockSet()->erase(rid);// 移除排他锁记录
+207   return true;
+208 }
+
+隔离级别与两阶段锁（2PL）的关系
+隔离级别          	是否严格2PL？	           首次解锁后状态
+READ_UNCOMMITTED	    ❌ 否	                保持 GROWING
+READ_COMMITTED	      ❌ 否	                保持 GROWING
+REPEATABLE_READ	     ✅ 是	                转为 SHRINKING
+SERIALIZABLE	        ✅ 是	                转为 SHRINKING
+
+REPEATABLE_READ 必须严格2PL：
+保证事务内多次读取同一数据的结果一致（避免不可重复读）。
+一旦释放锁，就不能再获取新锁（防止后续操作破坏一致性）。
+
+READ_COMMITTED 不严格2PL：
+允许在释放锁后继续获取新锁（可能读到其他事务提交的新数据）。
+```
+
+需要注意，当事务隔离级别为READ_COMMIT时，事务获得的读锁将在使用完毕后立即释放，因此该类事务不符合2PL规则，为了程序的兼容性，在这里认为READ_COMMIT事务在COMMIT或ABORT之前始终保持GROWING状态，对于其他事务，将在调用Unlock时转变为SHRINKING状态。在释放锁时，遍历锁请求对列并删除对应事务的锁请求，然后唤醒其他事务，并在事务的锁集合中删除该锁。
+
+### TASK3 - CONCURRENT QUERY EXECUTION
+
+在本部分中，需要为查询计划执行器的顺序扫描、插入、删除、更新计划的NEXT()方法提供元组锁的保护，使得上述计划可支持并发执行。
+
+```
+ 33 bool SeqScanExecutor::Next(Tuple *tuple, RID *rid) {
+ 34   const Schema *out_schema = this->GetOutputSchema();
+ 35   auto exec_ctx = GetExecutorContext();
+ 36   Transaction *txn = exec_ctx->GetTransaction();
+ 37   TransactionManager *txn_mgr = exec_ctx->GetTransactionManager();
+ 38   LockManager *lock_mgr = exec_ctx->GetLockManager();
+ 39   Schema table_schema = table_info_->schema_;
+ 40   while (iter_ != end_) {
+ 41     Tuple table_tuple = *iter_;
+ 42     *rid = table_tuple.GetRid();
+ 43     if (txn->GetSharedLockSet()->count(*rid) == 0U && txn->GetExclusiveLockSet()->count(*rid) == 0U) {
+ 44       if (txn->GetIsolationLevel() != IsolationLevel::READ_UNCOMMITTED && !lock_mgr->LockShared(txn, *rid)) {
+ 45         txn_mgr->Abort(txn);
+ 46       }
+ 47     }
+ 48     std::vector<Value> values;
+ 49     for (const auto &col : GetOutputSchema()->GetColumns()) {
+ 50       values.emplace_back(col.GetExpr()->Evaluate(&table_tuple, &table_schema));
+ 51     }
+ 52     *tuple = Tuple(values, out_schema);
+ 53     auto *predicate = plan_->GetPredicate();
+ 54     if (predicate == nullptr || predicate->Evaluate(tuple, out_schema).GetAs<bool>()) {
+ 55       ++iter_;
+ 56       if (txn->GetIsolationLevel() == IsolationLevel::READ_COMMITTED) {
+ 57         lock_mgr->Unlock(txn, *rid);
+ 58       }
+ 59       return true;
+ 60     }
+ 61     if (txn->GetSharedLockSet()->count(*rid) != 0U && txn->GetIsolationLevel() == IsolationLevel::READ_COMMITTED) {
+ 62       lock_mgr->Unlock(txn, *rid);
+ 63     }
+ 64     ++iter_;
+ 65   }
+ 66   return false;
+ 67 }
+```
+
+当SeqScanExecutor从表中获取元组时，需要在以下条件下为该元组加读锁，并当加锁失败时调用Abort杀死该元组：
+ - 事务不拥有该元组的读锁或写锁（由于一个事务中可能多次访问同一元组）；
+ - 事务的隔离等级不为READ_UNCOMMITTED。
+
+在使用完毕元组后，需要在以下条件下为该元组解锁：
+ - 事务拥有该元组的读锁（可能事务拥有的锁为写锁）；
+ - 事务的隔离等级为READ_COMMITTED时，需要在使用完读锁后立即释放，在其他等级下时，锁将在COMMIT或ABORT中被释放。
+
+```
+ 37 bool InsertExecutor::Next([[maybe_unused]] Tuple *tuple, RID *rid) {
+ 38   auto exec_ctx = GetExecutorContext();
+ 39   Transaction *txn = exec_ctx_->GetTransaction();
+ 40   TransactionManager *txn_mgr = exec_ctx->GetTransactionManager();
+ 41   LockManager *lock_mgr = exec_ctx->GetLockManager();
+ 42 
+ 43   Tuple tmp_tuple;
+ 44   RID tmp_rid;
+ 45   if (is_raw_) {
+ 46     for (uint32_t idx = 0; idx < size_; idx++) {
+ 47       const std::vector<Value> &raw_value = plan_->RawValuesAt(idx);
+ 48       tmp_tuple = Tuple(raw_value, &table_info_->schema_);
+ 49       if (table_info_->table_->InsertTuple(tmp_tuple, &tmp_rid, txn)) {
+ 50         if (!lock_mgr->LockExclusive(txn, tmp_rid)) {
+ 51           txn_mgr->Abort(txn);
+ 52         }
+ 53         for (auto indexinfo : indexes_) {
+ 54           indexinfo->index_->InsertEntry(
+ 55               tmp_tuple.KeyFromTuple(table_info_->schema_, indexinfo->key_schema_, indexinfo->index_->GetKeyAttrs()),
+ 56               tmp_rid, txn);
+ 57           IndexWriteRecord iwr(*rid, table_info_->oid_, WType::INSERT, *tuple, *tuple, indexinfo->index_oid_,
+ 58                                exec_ctx->GetCatalog());
+ 59           txn->AppendIndexWriteRecord(iwr);
+ 60         }
+ 61       }
+ 62     }
+ 63     return false;
+ 64   }
+ 65   while (child_executor_->Next(&tmp_tuple, &tmp_rid)) {
+ 66     if (table_info_->table_->InsertTuple(tmp_tuple, &tmp_rid, txn)) {
+ 67       if (!lock_mgr->LockExclusive(txn, *rid)) {
+ 68         txn_mgr->Abort(txn);
+ 69       }
+ 70       for (auto indexinfo : indexes_) {
+ 71         indexinfo->index_->InsertEntry(tmp_tuple.KeyFromTuple(*child_executor_->GetOutputSchema(),
+ 72                                                               indexinfo->key_schema_, indexinfo->index_->GetKeyAttrs()),
+ 73                                        tmp_rid, txn);
+ 74         txn->GetIndexWriteSet()->emplace_back(tmp_rid, table_info_->oid_, WType::INSERT, tmp_tuple, tmp_tuple,
+ 75                                               indexinfo->index_oid_, exec_ctx->GetCatalog());
+ 76       }
+ 77     }
+ 78   }
+ 79   return false;
+ 80 }
+```
+
+对于InsertExecutor，其在将元组插入表后获得插入表的写锁。需要注意，当其元组来源为其他计划节点时，其来源元组与插入表的元组不是同一个元组。
+
