@@ -4217,6 +4217,10 @@ READ_COMMITTED 不严格2PL：
  - 事务一旦开始释放锁（即第一次调用 Unlock），就进入 SHRINKING 阶段。
  - 之后该事务 不能再获取任何新锁，但 可以继续执行其他操作（如读已锁定数据、计算等）
 
+<img src="https://github.com/user-attachments/assets/828ffc13-06b4-4896-ac0b-3619d9ddcac3" 
+     alt="image" 
+     style="width:80%; max-width:600px;">
+
 
 ### TASK3 - CONCURRENT QUERY EXECUTION
 
