@@ -3690,7 +3690,7 @@ TransactionManager中进行事务的实际行为，如BEGIN、COMMIT、ABORT，�
  55   };
 ```
 
-**LockShared**
+### LockShared
 
 在LockShared中，事务txn请求元组ID为rid的读锁：
 
