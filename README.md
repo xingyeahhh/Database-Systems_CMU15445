@@ -3612,3 +3612,228 @@ DistinctKey{
 283 };
 284 
 ```
+
+bustub中事务由Transaction以及TransactionManager管理。Transaction中维护了事务的全部信息，包括事务ID、事务隔离级别、事务的状态（锁扩张、锁收缩、COMMIT及ABORT）、事务的元组修改记录及索引修改记录、事务的页面修改记录、以及事务当前所拥有的锁。
+
+TransactionManager中进行事务的实际行为，如BEGIN、COMMIT、ABORT，并可以通过其获得对应ID的具体事务
+
+![image](https://github.com/user-attachments/assets/859fc34f-1e46-4c24-b779-db5c005a6407)
+
+事务的不同隔离级别将导致不同的可能并发异常情况，并在两阶段锁策略中通过不同的获取释放锁方式实现。
+
+<img src="https://github.com/user-attachments/assets/db5509ef-293e-4464-94c6-21e30dad15bd" 
+     alt="image" 
+     style="width:80%; max-width:600px;">
+
+
+**事务异常（Anomalies）这些是并发事务执行时可能出现的异常情况：**
+ - 脏读（Dirty Read）
+   - 一个事务读取了另一个事务 未提交 的数据。
+   - 例子：事务A修改了某行但未提交，事务B读取了该行，之后事务A回滚，导致事务B读到了无效数据。
+ - 不可重复读（Unrepeatable Reads）
+   - 同一事务内，多次读取同一数据，结果不同（因其他事务修改了该数据并提交）。
+   - 例子：事务A第一次读取某行值为100，事务B修改该行为200并提交，事务A再次读取该行发现值变了。
+ - 幻读（Phantom Reads）
+   - 同一事务内，多次执行相同的 范围查询，返回的行数不同（因其他事务插入或删除了符合条件的数据）。
+   - 例子：事务A查询年龄<30的人有10条记录，事务B插入一条年龄=25的新记录并提交，事务A再次查询时发现返回11条记录。
+
+**隔离级别（Isolation Levels，隔离级别定义了事务之间的可见性规则，从最强（最严格）到最弱（最宽松）排序如下：**
+ - 可串行化（SERIALIZABLE）
+   - 特点：完全隔离，事务如同串行执行。
+   - 解决的问题：所有异常（脏读、不可重复读、幻读）。
+   - 代价：性能最低（通过严格加锁或多版本控制实现）。
+ - 可重复读（REPEATABLE READS）
+   - 特点：允许幻读，但禁止脏读和不可重复读。
+   - 例子：MySQL的默认隔离级别（通过MVCC避免不可重复读，但范围查询可能幻读）。
+ - 读已提交（READ-COMMITTED）
+   - 特点：允许幻读和不可重复读，但禁止脏读。
+   - 例子：PostgreSQL的默认隔离级别（事务只能看到已提交的数据）。
+ - 读未提交（READ-UNCOMMITTED）
+   - 特点：所有异常都可能发生。
+   - 场景：几乎不用，除非允许脏读（如某些统计场景）。
+  
+**2PL = Two-Phase Locking**
+
+事务的加锁和解锁必须分为两个阶段：
+ - 扩展阶段（Growing Phase）：事务只能 获取锁，不能释放锁。
+ - 收缩阶段（Shrinking Phase）：事务只能 释放锁，不能获取锁。
+
+**死锁预防策略**
+
+在本实验中，将通过Wound-Wait策略实现死锁预防，其具体方法为：当优先级高的事务等待优先级低的事务的锁时，将优先级低的事务杀死；当优先级低的事务等待优先级高的事务的锁时，优先级低的事务将阻塞。在bustub中，事务的优先级通过其事务ID确定，越小的事务ID将代表更高的优先级。
+
+**锁请求表**
+
+![image](https://github.com/user-attachments/assets/55ac21c4-dd1c-4a8f-bca8-1396b3d5a2df)
+
+在锁管理器中，使用lock table管理锁，lock table是以元组ID为键，锁请求队列为值的哈希表。其中，锁请求中保存了请求该元组锁的事务ID、请求的元组锁类型、以及请求是否被许可；通过队列的方式保存锁保证了锁请求的先后顺序：
+
+```
+ 38   class LockRequest {
+ 39    public:
+ 40     LockRequest(txn_id_t txn_id, LockMode lock_mode) : txn_id_(txn_id), lock_mode_(lock_mode), granted_(false) {}
+ 41 
+ 42     txn_id_t txn_id_;      // 请求锁的事务ID
+ 43     LockMode lock_mode_;   // 锁模式（如共享锁S/排他锁X）如 SHARED、EXCLUSIVE
+ 44     bool granted_;         // 是否已授予锁（初始为false）
+ 45   };
+ 46 
+ 47   class LockRequestQueue {
+ 48    public:
+ 49     std::list<LockRequest> request_queue_;   // 当前数据项上的锁请求队列
+ 50     std::mutex latch_;                       // 保护队列的互斥锁
+
+ 51     // for notifying blocked transactions on this rid， 用于唤醒等待事务的条件变量
+ 52     std::condition_variable cv_;
+ 53     // txn_id of an upgrading transaction (if any)
+ 54     txn_id_t upgrading_ = INVALID_TXN_ID;
+ 55   };
+```
+
+**LockShared**
+
+在LockShared中，事务txn请求元组ID为rid的读锁：
+
+```
+ 20 auto LockManager::LockShared(Transaction *txn, const RID &rid) -> bool {
+ 21   if (txn->GetState() == TransactionState::ABORTED) {
+ 22     return false;
+ 23   }
+//如果事务已被标记为 ABORTED，说明它之前因某种原因（如死锁）被终止，此时不允许再加锁，直接返回 false
+
+ 24   if (txn->GetState() == TransactionState::SHRINKING) {
+ 25     txn->SetState(TransactionState::ABORTED);
+ 26     throw TransactionAbortException(txn->GetTransactionId(), AbortReason::LOCK_ON_SHRINKING);
+ 27   }
+//收缩阶段（SHRINKING） 是两阶段锁协议（2PL）的第二阶段，事务只能释放锁，不能获取新锁。
+//如果事务尝试在收缩阶段获取共享锁，直接将其状态设为 ABORTED，并抛出异常（AbortReason::LOCK_ON_SHRINKING）
+
+ 28   if (txn->GetIsolationLevel() == IsolationLevel::READ_UNCOMMITTED) {
+ 29     txn->SetState(TransactionState::ABORTED);
+ 30     throw TransactionAbortException(txn->GetTransactionId(), AbortReason::LOCKSHARED_ON_READ_UNCOMMITTED);
+ 31   }
+//READ_UNCOMMITTED 是最低隔离级别，允许脏读，通常 不获取共享锁（直接读取最新数据，包括未提交的修改）。
+//如果事务在该隔离级别下尝试获取共享锁，视为非法操作，直接中止事务并抛出异常（AbortReason::LOCKSHARED_ON_READ_UNCOMMITTED）。
+```
+
+20-31行：进行前置判断，当事务的状态为ABORT时，直接返回假；如当前的事务状态为锁收缩时，调用获取锁函数将导致事务ABORT并抛出异常；当事务的隔离级别的READ_UNCOMMITTED时，其不应获取读锁，尝试获取读锁将导致ABORT并抛出异常。
+
+```
+//设置事务状态为 GROWING（扩展阶段），（2PL 协议的第一阶段），表示可以获取新锁。
+ 32   txn->SetState(TransactionState::GROWING);
+
+//通过 latch_ 保护 lock_table_（全局锁表）的线程安全，防止并发修改冲突。
+//latch_	 --> std::mutex	被锁的互斥量（通常是成员变量）
+//lk	--> std::unique_lock	负责管理锁的生命周期
+//创建一个 std::unique_lock 对象 lk，并立刻尝试锁住 latch_。
+ 33   std::unique_lock<std::mutex> lk(latch_);
+
+ 34   auto &lock_request_queue = lock_table_[rid];              // 获取目标数据项（RID）的锁队列
+ 35   auto &request_queue = lock_request_queue.request_queue_;  // 锁请求列表
+ 36   auto &cv = lock_request_queue.cv_;       // 条件变量（用于唤醒阻塞事务）,condition variable
+ 37   auto txn_id = txn->GetTransactionId();                    // 当前事务ID
+//lock_table_ 是一个哈希表，以 RID（记录ID）为键，存储每个数据项的锁请求队列（LockRequestQueue）
+
+ 
+ 38   request_queue.emplace_back(txn_id, LockMode::SHARED);  // 创建共享锁请求并加入队列
+ 39   txn->GetSharedLockSet()->emplace(rid);                 // 记录事务持有的共享锁
+ 40   txn_table_[txn_id] = txn;                              // 更新事务表（用于后续查找）
+
+ 41   //Wound Wait : Kill all low priority transaction
+      //Wound-Wait 死锁预防策略
+ 42   bool can_grant = true;    // 当前请求是否能立即授予
+ 43   bool is_kill = false;     // 是否终止了其他事务
+ 44   for (auto &request : request_queue) {
+ 45     if (request.lock_mode_ == LockMode::EXCLUSIVE) {
+      // Wound-Wait 规则：高优先级（txn_id 更小）事务可终止低优先级事务
+ 46       if (request.txn_id_ > txn_id) {    // 当前事务优先级更高
+ 47         txn_table_[request.txn_id_]->SetState(TransactionState::ABORTED);
+            // 终止低优先级事务
+ 48         is_kill = true;
+ 49       } else {
+            // 当前事务优先级更低，需等待
+ 50         can_grant = false;
+ 51       }
+ 52     }
+         // 找到当前事务的请求，设置授予状态
+ 53     if (request.txn_id_ == txn_id) {
+ 54       request.granted_ = can_grant;
+ 55       break;
+ 56     }
+ 57   }
+
+Wound-Wait 规则：
+高优先级事务（txn_id 更小） 可以强制终止（Wound）低优先级事务（txn_id 更大）以获取锁。
+低优先级事务 需等待（Wait）高优先级事务完成。
+作用：预防死锁，避免事务相互阻塞。
+
+ 58   if (is_kill) {
+ 59     cv.notify_all();   // 唤醒所有等待线程，让被终止的事务清理资源
+//如果有事务被终止（is_kill == true），通过条件变量 cv 唤醒所有等待线程，被终止的事务会检测到自身状态为 ABORTED 并退出。
+ 60   }
+
+锁授予逻辑
+若能立即授予锁（can_grant == true）：
+当前事务的 granted_ 被设为 true，锁请求成功。
+若需等待（can_grant == false）：
+当前事务的 granted_ 保持 false，后续会通过 cv.wait() 阻塞，直到锁可用。
+
+关键设计思想
+两阶段锁协议（2PL）
+事务在 GROWING 阶段获取锁，确保可串行化。
+
+Wound-Wait 死锁预防
+通过事务ID（txn_id）定义优先级，避免循环等待。
+对比其他策略（如 Wait-Die）：
+Wound-Wait：高优先级事务主动终止低优先级事务。
+Wait-Die：低优先级事务主动等待（不终止）。
+
+线程安全与唤醒机制
+通过 mutex（latch_）和 condition_variable（cv_）实现高效阻塞/唤醒。
+```
+
+**示例场景**
+
+假设两个事务并发请求锁：
+ - 事务T1（txn_id=1） 请求共享锁（S）。
+ - 事务T2（txn_id=2） 已持有排他锁（X）。
+
+执行流程：
+
+ - T1 的锁请求加入队列，检查发现 T2 持有冲突的 X 锁。
+ - 由于 T1 的 txn_id 更小（优先级更高），触发 Wound-Wait 规则：
+ - T2 被强制终止（ABORTED），其 X 锁释放。
+ - T1 的共享锁被授予（granted_ = true）。
+ - 若 T1 的 txn_id 更大（优先级更低），则 T1 需等待 T2 释放锁。
+
+ - 锁请求流程：检查状态 → 加入队列 → 冲突检测 → 授予或等待。
+ - Wound-Wait 核心：高优先级事务可杀死低优先级事务，避免死锁。
+ - 性能权衡：牺牲部分低优先级事务，换取系统整体吞吐量
+
+32-60行：如前置判断通过，则将当前事务状态置为GROWING，并获得互斥锁保护锁管理器的数据结构。然后，获取对应元组ID的锁请求队列及其相关成员，并将当前事务的锁请求加入队列。在这里txn_table_为保存<事务ID、事务>的二元组。需要注意，在该请求被加入队列时将就应当调用GetSharedLockSet()将该元组ID加入事务的持有锁集合，使得该锁被杀死时能将该请求从队列中删除。
+
+为了避免死锁，事务需要检查当前队列是否存在使得其阻塞的锁请求，如存在则判断当前事务的优先级是否高于该请求的事务，如是则杀死该事务；如非则将can_grant置为false表示事务将被阻塞。如该事务杀死了任何其他事务，则通过锁请求队列的条件变量cv唤醒其他等待锁的事务，使得被杀死的事务可以退出请求队列。
+
+```
+ 61   //Wait the lock
+ 62   while (!can_grant) {
+ 63     for (auto &request : request_queue) {
+ 64       if (request.lock_mode_ == LockMode::EXCLUSIVE &&
+ 65           txn_table_[request.txn_id_]->GetState() != TransactionState::ABORTED) {
+ 66         break;
+ 67       }
+ 68       if (request.txn_id_ == txn_id) {
+ 69         can_grant = true;
+ 70         request.granted_ = true;
+ 71       }
+ 72     }
+ 73     if (!can_grant) {
+ 74       cv.wait(lk);
+ 75     }
+ 76     if (txn->GetState() == TransactionState::ABORTED) {
+ 77       throw TransactionAbortException(txn->GetTransactionId(), AbortReason::DEADLOCK);
+ 78     }
+ 79   }
+ 80   return true;
+ 81 }
+```
