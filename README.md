@@ -4229,40 +4229,63 @@ READ_COMMITTED 不严格2PL：
 
 ```
  33 bool SeqScanExecutor::Next(Tuple *tuple, RID *rid) {
- 34   const Schema *out_schema = this->GetOutputSchema();
- 35   auto exec_ctx = GetExecutorContext();
- 36   Transaction *txn = exec_ctx->GetTransaction();
- 37   TransactionManager *txn_mgr = exec_ctx->GetTransactionManager();
- 38   LockManager *lock_mgr = exec_ctx->GetLockManager();
- 39   Schema table_schema = table_info_->schema_;
+ 34   const Schema *out_schema = this->GetOutputSchema(); // 输出模式
+ 35   auto exec_ctx = GetExecutorContext();               // 执行上下文
+ 36   Transaction *txn = exec_ctx->GetTransaction();      // 当前事务
+ 37   TransactionManager *txn_mgr = exec_ctx->GetTransactionManager();// 事务管理器
+ 38   LockManager *lock_mgr = exec_ctx->GetLockManager();// 锁管理器
+ 39   Schema table_schema = table_info_->schema_; // 表模式
+
  40   while (iter_ != end_) {
  41     Tuple table_tuple = *iter_;
  42     *rid = table_tuple.GetRid();
+
+        // 锁获取逻辑
  43     if (txn->GetSharedLockSet()->count(*rid) == 0U && txn->GetExclusiveLockSet()->count(*rid) == 0U) {
  44       if (txn->GetIsolationLevel() != IsolationLevel::READ_UNCOMMITTED && !lock_mgr->LockShared(txn, *rid)) {
- 45         txn_mgr->Abort(txn);
+ 45         txn_mgr->Abort(txn);    // 加锁失败则中止事务
  46       }
  47     }
+锁获取策略：
+检查是否已持有该记录的锁(共享锁或排他锁)
+若未持有锁且隔离级别不是READ_UNCOMMITTED，尝试获取共享锁
+加锁失败会中止整个事务
+
+
  48     std::vector<Value> values;
+        // 根据输出模式计算各列值
  49     for (const auto &col : GetOutputSchema()->GetColumns()) {
  50       values.emplace_back(col.GetExpr()->Evaluate(&table_tuple, &table_schema));
  51     }
- 52     *tuple = Tuple(values, out_schema);
+ 52     *tuple = Tuple(values, out_schema);  // 构造输出元组
+
+
  53     auto *predicate = plan_->GetPredicate();
  54     if (predicate == nullptr || predicate->Evaluate(tuple, out_schema).GetAs<bool>()) {
  55       ++iter_;
+          // READ_COMMITTED级别下立即释放锁
  56       if (txn->GetIsolationLevel() == IsolationLevel::READ_COMMITTED) {
  57         lock_mgr->Unlock(txn, *rid);
  58       }
- 59       return true;
+ 59       return true;   // 返回有效元组
  60     }
+特殊处理：
+无谓词或谓词满足时返回元组
+READ_COMMITTED级别下立即释放锁(不保持到事务结束)
+
  61     if (txn->GetSharedLockSet()->count(*rid) != 0U && txn->GetIsolationLevel() == IsolationLevel::READ_COMMITTED) {
- 62       lock_mgr->Unlock(txn, *rid);
+ 62       lock_mgr->Unlock(txn, *rid); // 释放不匹配元组的锁
  63     }
  64     ++iter_;
  65   }
  66   return false;
  67 }
+
+隔离级别	            锁获取时机	         锁释放时机	          特点
+READ_UNCOMMITTED	   不获取锁	            无锁可释放	       可能脏读
+READ_COMMITTED	     访问时获取共享锁	    使用后立即释放	   避免脏读，不可重复读
+REPEATABLE_READ	    访问时获取共享锁	    事务结束时释放	   保证可重复读
+SERIALIZABLE	       访问时获取共享锁	    事务结束时释放	   最高隔离级别
 ```
 
 当SeqScanExecutor从表中获取元组时，需要在以下条件下为该元组加读锁，并当加锁失败时调用Abort杀死该元组：
@@ -4275,49 +4298,109 @@ READ_COMMITTED 不严格2PL：
 
 ```
  37 bool InsertExecutor::Next([[maybe_unused]] Tuple *tuple, RID *rid) {
- 38   auto exec_ctx = GetExecutorContext();
- 39   Transaction *txn = exec_ctx_->GetTransaction();
- 40   TransactionManager *txn_mgr = exec_ctx->GetTransactionManager();
- 41   LockManager *lock_mgr = exec_ctx->GetLockManager();
+ 38   auto exec_ctx = GetExecutorContext();                             // 执行上下文
+ 39   Transaction *txn = exec_ctx_->GetTransaction();                   // 当前事务
+ 40   TransactionManager *txn_mgr = exec_ctx->GetTransactionManager();  // 事务管理器
+ 41   LockManager *lock_mgr = exec_ctx->GetLockManager();               // 锁管理器
  42 
  43   Tuple tmp_tuple;
  44   RID tmp_rid;
+
+ //原始值插入模式
+ //直接插入计划中提供的原始值
+ //适用于INSERT VALUES (...)语句
  45   if (is_raw_) {
  46     for (uint32_t idx = 0; idx < size_; idx++) {
- 47       const std::vector<Value> &raw_value = plan_->RawValuesAt(idx);
- 48       tmp_tuple = Tuple(raw_value, &table_info_->schema_);
+ 47       const std::vector<Value> &raw_value = plan_->RawValuesAt(idx);// 获取第idx个值列表
+ 48       tmp_tuple = Tuple(raw_value, &table_info_->schema_);          // 将值转换为Tuple对象
  49       if (table_info_->table_->InsertTuple(tmp_tuple, &tmp_rid, txn)) {
- 50         if (!lock_mgr->LockExclusive(txn, tmp_rid)) {
- 51           txn_mgr->Abort(txn);
+            // 锁管理和索引维护，尝试插入表，成功返回true
+ 50         if (!lock_mgr->LockExclusive(txn, tmp_rid)) {  // 对新插入的记录加排他锁
+ 51           txn_mgr->Abort(txn);  // 加锁失败则中止事务
  52         }
- 53         for (auto indexinfo : indexes_) {
- 54           indexinfo->index_->InsertEntry(
- 55               tmp_tuple.KeyFromTuple(table_info_->schema_, indexinfo->key_schema_, indexinfo->index_->GetKeyAttrs()),
- 56               tmp_rid, txn);
- 57           IndexWriteRecord iwr(*rid, table_info_->oid_, WType::INSERT, *tuple, *tuple, indexinfo->index_oid_,
- 58                                exec_ctx->GetCatalog());
- 59           txn->AppendIndexWriteRecord(iwr);
+ 53         for (auto indexinfo : indexes_) {     // 遍历所有相关索引
+ 54           indexinfo->index_->InsertEntry(   // 向索引插入条目
+ 55               tmp_tuple.KeyFromTuple(  // 从元组提取索引键
+                                         table_info_->schema_,// 表结构
+                                         indexinfo->key_schema_,// 索引键结构
+                                         indexinfo->index_->GetKeyAttrs()),// 索引键属性
+ 56                                      tmp_rid, txn);// 记录ID和事务
+ 57           IndexWriteRecord iwr(   // 创建索引写记录
+                                   *rid,  // 记录ID
+                                   table_info_->oid_,   // 表OID
+                                   WType::INSERT,// 操作类型(插入)
+                                   *tuple, *tuple, // 旧值和新值(插入时相同)
+                                   indexinfo->index_oid_,// 索引OID
+ 58                                exec_ctx->GetCatalog());// 目录
+ 59                                txn->AppendIndexWriteRecord(iwr);// 将记录加入事务
  60         }
  61       }
  62     }
- 63     return false;
+ 63     return false;    // 原始值插入模式不返回元组
  64   }
+
+//子执行器插入模式(is_raw_ == false)
+//从子执行器获取要插入的元组
+//适用于INSERT INTO ... SELECT ...语句
  65   while (child_executor_->Next(&tmp_tuple, &tmp_rid)) {
- 66     if (table_info_->table_->InsertTuple(tmp_tuple, &tmp_rid, txn)) {
- 67       if (!lock_mgr->LockExclusive(txn, *rid)) {
- 68         txn_mgr->Abort(txn);
+      // 从子执行器获取元组
+ 66     if (table_info_->table_->InsertTuple(tmp_tuple, &tmp_rid, txn)) {// 插入表
+ 67       if (!lock_mgr->LockExclusive(txn, *rid)) {// 对新记录加排他锁
+ 68         txn_mgr->Abort(txn);// 加锁失败则中止
  69       }
- 70       for (auto indexinfo : indexes_) {
- 71         indexinfo->index_->InsertEntry(tmp_tuple.KeyFromTuple(*child_executor_->GetOutputSchema(),
- 72                                                               indexinfo->key_schema_, indexinfo->index_->GetKeyAttrs()),
- 73                                        tmp_rid, txn);
- 74         txn->GetIndexWriteSet()->emplace_back(tmp_rid, table_info_->oid_, WType::INSERT, tmp_tuple, tmp_tuple,
- 75                                               indexinfo->index_oid_, exec_ctx->GetCatalog());
+ 70       for (auto indexinfo : indexes_) {// 更新所有索引
+ 71         indexinfo->index_->InsertEntry(
+                         tmp_tuple.KeyFromTuple(   // 从元组提取键
+                         *child_executor_->GetOutputSchema(),   // 子执行器输出模式
+ 72                      indexinfo->key_schema_,  // 索引键模式
+                         indexinfo->index_->GetKeyAttrs()),  // 键属性
+ 73                      tmp_rid, txn);  // 记录ID和事务
+
+ 74         txn->GetIndexWriteSet()->emplace_back(  // 记录索引修改
+                         tmp_rid,  // 记录ID
+                         table_info_->oid_,  // 表OID
+                         WType::INSERT,  // 操作类型
+                         tmp_tuple, tmp_tuple,  // 前后值
+ 75                      indexinfo->index_oid_,   // 索引OID
+                         exec_ctx->GetCatalog());  // 目录
  76       }
  77     }
  78   }
- 79   return false;
+ 79   return false;        // 插入操作不返回元组
  80 }
+
+1. 为什么插入操作总是用排他锁(X锁)？
+(1) 根本原因：插入是"写操作"
+插入 = 创建新数据 + 可能修改索引结构
+排他锁(X锁)的作用：
+- 防止其他事务读取未提交的插入（避免脏读）
+- 防止其他事务并发插入相同位置（避免丢失更新）
+
+(2) 与隔离级别无关
+即使是最低的READ_UNCOMMITTED级别：
+- 允许读未提交 ≠ 允许写未提交
+- 所有隔离级别下，写操作都必须加排他锁（这是原子性的基本要求）
+
+2. 为什么看不到Unlock调用？
+(1) 严格两阶段锁协议(Strict 2PL)
+// 事务提交/回滚时才统一释放锁
+
+~Transaction() {
+    if (state_ != COMMITTED && state_ != ABORTED) {
+        Abort();  // 自动回滚未完成的事务
+    }
+    // 释放所有锁 (由LockManager处理)
+}
+
+锁的生命周期：持有直到事务结束（提交/回滚）
+设计优势：
+- 避免中间状态被其他事务看到
+- 简化回滚逻辑（无需中途解锁）
+
+(2) 与SELECT的对比
+操作	      锁类型	        释放时机	                   隔离级别影响
+SELECT	   共享锁(S锁)	  READ_COMMITTED: 立即释放	    影响锁获取逻辑
+INSERT	   排他锁(X锁)	  事务结束时释放	             对所有级别行为一致
 ```
 
 对于InsertExecutor，其在将元组插入表后获得插入表的写锁。需要注意，当其元组来源为其他计划节点时，其来源元组与插入表的元组不是同一个元组。
