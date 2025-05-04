@@ -4224,7 +4224,7 @@ READ_COMMITTED 不严格2PL：
 
 
 
-### TASK3 - CONCURRENT QUERY EXECUTION
+#### TASK3 - CONCURRENT QUERY EXECUTION
 
 在本部分中，需要为查询计划执行器的顺序扫描、插入、删除、更新计划的NEXT()方法提供元组锁的保护，使得上述计划可支持并发执行。
 
