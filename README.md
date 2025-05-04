@@ -221,6 +221,54 @@ data_[i][j] == *(data_[i] + j) == linear_[i * cols + j]
 
 在本实验中，需要在存储管理器中实现缓冲池。缓冲池负责将物理页面从磁盘中读入内存、或从内存中写回磁盘，使得DBMS可以支持大于内存大小的存储容量。并且，缓冲池应当是用户透明且线程安全的。
 
+```
+I can explain how your buffer pool manager implementation achieves transparency and supports databases larger than available memory. These are key features of the system you built.
+
+## Transparency to Users
+
+Your implementation achieves transparency through several mechanisms:
+
+1. **Abstraction through Page IDs**: The buffer pool manager completely separates the concept of page IDs (which identify disk pages) from frame IDs (which identify memory locations). Users of the system only interact with page IDs through methods like `FetchPage()`, `NewPage()`, etc. 
+
+2. **Automatic Page Loading/Unloading**: When users request a page via its ID, the buffer pool automatically:
+   - Checks if the page is already in memory
+   - Loads it from disk if needed
+   - Manages memory allocation transparently
+   - Writes back dirty pages when necessary
+
+3. **Pin/Unpin Mechanism**: The system tracks page usage with a pin count. Users simply:
+   - Pin a page when they need it (incrementing the counter)
+   - Unpin it when they're done (decrementing the counter)
+   - Optionally flag if they've modified it (is_dirty)
+   
+   This allows users to focus on their data operations without worrying about memory management.
+
+4. **Page Table Abstraction**: The page table (`page_table_` unordered_map) maintains the mapping between page IDs and frame IDs internally, so users never need to know which physical frame contains their data.
+
+## Supporting Databases Larger than Available Memory
+
+Your implementation supports databases larger than memory through:
+
+1. **Page Replacement Policy (LRU)**: The LRU (Least Recently Used) replacer tracks page usage and intelligently selects victim pages when memory is full. This ensures efficient use of limited memory resources.
+
+2. **On-Demand Loading**: Pages are only loaded into memory when they're actually requested, so the system only uses memory for active pages.
+
+3. **Dirty Page Management**: Modified pages are tracked and written back to disk when evicted, ensuring data persistence without keeping everything in memory.
+
+4. **Parallel Buffer Pool Management**: Your implementation includes a parallel buffer pool manager that:
+   - Distributes pages across multiple independent buffer pool instances
+   - Reduces lock contention through page ID partitioning
+   - Implements load balancing through round-robin allocation
+
+5. **Efficient Victim Selection**: When memory is full, the system can select victims from:
+   - Free list (unused frames) first
+   - LRU replacer for pages that aren't currently pinned
+
+These mechanisms together create a virtual memory abstraction for database pages, making the database appear to have unlimited memory from the user's perspective, while efficiently managing the actual limited physical memory behind the scenes.
+
+The key insight in your implementation is that proper page replacement and transparent page loading/unloading allows the system to effectively manage a working set of pages that's much smaller than the total database size, while still providing efficient access to the full dataset.
+```
+
 ### Task1 : LRU REPLACEMENT POLICY
 本部分中需要实现缓冲池中的LRUReplacer，该组件的功能是跟踪缓冲池内的页面使用情况，并在缓冲池容量不足时驱除缓冲池中最近最少使用的页面。其应当具备如下接口：
 
