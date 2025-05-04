@@ -4407,34 +4407,97 @@ INSERT	   排他锁(X锁)	  事务结束时释放	             对所有级别�
 
 ```
  30 bool DeleteExecutor::Next([[maybe_unused]] Tuple *tuple, RID *rid) {
- 31   auto exec_ctx = GetExecutorContext();
- 32   Transaction *txn = exec_ctx_->GetTransaction();
- 33   TransactionManager *txn_mgr = exec_ctx->GetTransactionManager();
- 34   LockManager *lock_mgr = exec_ctx->GetLockManager();
+ 31   auto exec_ctx = GetExecutorContext();             // 执行上下文
+ 32   Transaction *txn = exec_ctx_->GetTransaction();   // 当前事务
+ 33   TransactionManager *txn_mgr = exec_ctx->GetTransactionManager();  // 事务管理器
+ 34   LockManager *lock_mgr = exec_ctx->GetLockManager();               // 锁管理器
  35 
  36   while (child_executor_->Next(tuple, rid)) {
+      // 删除处理逻辑
+      // 从子执行器逐个获取要删除的元组
+      // 每个元组及其RID(记录ID)会被处理
+
  37     if (txn->GetIsolationLevel() != IsolationLevel::REPEATABLE_READ) {
- 38       if (!lock_mgr->LockExclusive(txn, *rid)) {
+ 38       if (!lock_mgr->LockExclusive(txn, *rid)) {  // 直接获取排他锁
  39         txn_mgr->Abort(txn);
  40       }
  41     } else {
- 42       if (!lock_mgr->LockUpgrade(txn, *rid)) {
+ 42       if (!lock_mgr->LockUpgrade(txn, *rid)) {  // 从共享锁升级为排他锁
  43         txn_mgr->Abort(txn);
  44       }
  45     }
- 46     if (table_info_->table_->MarkDelete(*rid, txn)) {
+锁策略选择：
+非REPEATABLE_READ级别：直接获取排他锁(X锁)
+REPEATABLE_READ级别：从共享锁(S锁)升级为排他锁(X锁)
+  - 因为REPEATABLE_READ下，子执行器可能已经持有共享锁
+
+ 46     if (table_info_->table_->MarkDelete(*rid, txn)) {   //MarkDelete将记录标记为已删除(逻辑删除)
  47       for (auto indexinfo : indexes_) {
- 48         indexinfo->index_->DeleteEntry(tuple->KeyFromTuple(*child_executor_->GetOutputSchema(), i    ndexinfo->key_schema_,
- 49                                                            indexinfo->index_->GetKeyAttrs()),
- 50                                        *rid, txn);
- 51         IndexWriteRecord iwr(*rid, table_info_->oid_, WType::DELETE, *tuple, *tuple, indexinfo->i    ndex_oid_,
- 52                              exec_ctx->GetCatalog());
- 53         txn->AppendIndexWriteRecord(iwr);
+ 48         indexinfo->index_->DeleteEntry(
+               tuple->KeyFromTuple(
+                    *child_executor_->GetOutputSchema(),
+                     indexinfo->key_schema_,
+ 49                  indexinfo->index_->GetKeyAttrs()),
+ 50                  *rid, txn);
+ 51         IndexWriteRecord iwr(
+                     *rid,
+                      table_info_->oid_,
+                      WType::DELETE, *tuple,
+                      *tuple, indexinfo->index_oid_,//从元组提取索引键
+ 52                   exec_ctx->GetCatalog());//从索引中删除对应的条目
+ 53         txn->AppendIndexWriteRecord(iwr);//记录索引修改以便回滚
  54       }
  55     }
  56   }
  57   return false;
  58 }
+
+特性	          DeleteExecutor	         InsertExecutor
+锁策略	         可能升级锁(S→X)	           直接获取X锁
+表操作	          MarkDelete标记删除	    InsertTuple插入新记录
+索引操作	      DeleteEntry删除索引项	    InsertEntry添加索引项
+记录类型          	WType::DELETE	          WType::INSERT
+返回值	              总是false	              总是false
+
+
+隔离级别	              锁策略	              设计考虑
+READ_UNCOMMITTED	   直接获取X锁	      不依赖前置S锁，简单加锁
+READ_COMMITTED	     直接获取X锁	      保证已提交读，不保持S锁
+REPEATABLE_READ	    S锁升级为X锁	     保证可重复读，利用已有S锁
+SERIALIZABLE	       S锁升级为X锁	       最高隔离级别，严格串行化
+
+1. 核心问题：为什么删除操作需要锁升级？
+(1) 基本锁策略对比
+方案	直接获取排他锁(X锁)	共享锁(S锁)升级排他锁(X锁)
+锁获取时机	删除时直接获取X锁	先获取S锁，删除时升级X锁
+并发性能	较高（减少锁转换）	较低（需锁升级）
+防止幻读	较弱	更强
+REPEATABLE_READ要求	不满足	满足
+
+(2) 关键原因：REPEATABLE_READ隔离级别的语义要求
+在REPEATABLE_READ级别下：
+查询阶段：执行器需要先扫描数据（此时获取S锁保证读一致性）
+删除阶段：需要将S锁升级为X锁，确保：
+不会丢失扫描期间看到的记录（防止幻读）
+与其他事务的读写操作正确互斥
+
+2. 具体场景分析
+场景1：直接获取X锁的问题
+-- 事务1 (REPEATABLE_READ)
+BEGIN;
+SELECT * FROM users WHERE age > 18; -- 应该看到10条
+-- 事务2在此插入1条age=20的记录
+DELETE FROM users WHERE age > 18; -- 如果直接X锁，可能删除11条（幻读）
+COMMIT;
+问题：违反REPEATABLE_READ的"可重复读"语义
+
+场景2：锁升级的正确处理
+BEGIN;
+SELECT * FROM users WHERE age > 18; -- 获取S锁，看到10条
+-- 事务2尝试插入age=20会被阻塞（因为S锁阻止其他事务修改扫描范围）
+DELETE FROM users WHERE age > 18; -- S锁升级X锁，确保只删除最初看到的10条
+COMMIT;
+保证：删除的正是最初查询看到的记录集
 ```
 
 对于DeleteExecutor和UpdateExecutor，在其获得子计划节点元组后，应当为该元组加读锁。需要注意的是，当事务隔离等级为REPEATABLE_READ时，其子计划节点拥有该元组的读锁，因此此时应该调用LockUpgrade升级锁，而不是获得新写锁。
