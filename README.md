@@ -1,6 +1,7 @@
 # Database-Systems_CMU15445
 This is the CMU15445-Database Systems course project, consisting of five lab assignments. 
 
+本教程是基于jlu-xiurui研究的基础上增加了一些索引；
 在本课程项目中，需要完成关系数据库bustub的磁盘页面缓冲池、索引功能、查询执行功能以及并发控制功能。并在课程中学习关如下知识：
 
 关系数据库的基本概念，以及基于SQLite简易关系数据库的SQL语句语法及其实践；
